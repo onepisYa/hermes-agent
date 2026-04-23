@@ -17,6 +17,64 @@ describe('createSlashHandler', () => {
     expect(getOverlayState().picker).toBe(true)
   })
 
+  it('opens the skills hub locally for bare /skills', () => {
+    const ctx = buildCtx()
+
+    expect(createSlashHandler(ctx)('/skills')).toBe(true)
+    expect(getOverlayState().skillsHub).toBe(true)
+    expect(ctx.gateway.rpc).not.toHaveBeenCalled()
+    expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
+  })
+
+  it('routes /skills install <name> to skills.manage without opening overlay', () => {
+    const ctx = buildCtx()
+
+    expect(createSlashHandler(ctx)('/skills install foo')).toBe(true)
+    expect(getOverlayState().skillsHub).toBe(false)
+    expect(ctx.gateway.rpc).toHaveBeenCalledWith('skills.manage', {
+      action: 'install',
+      query: 'foo'
+    })
+  })
+
+  it('routes /skills inspect <name> to skills.manage', () => {
+    const ctx = buildCtx()
+
+    createSlashHandler(ctx)('/skills inspect my-skill')
+    expect(ctx.gateway.rpc).toHaveBeenCalledWith('skills.manage', {
+      action: 'inspect',
+      query: 'my-skill'
+    })
+  })
+
+  it('routes /skills search <query> to skills.manage', () => {
+    const ctx = buildCtx()
+
+    createSlashHandler(ctx)('/skills search vibe')
+    expect(ctx.gateway.rpc).toHaveBeenCalledWith('skills.manage', {
+      action: 'search',
+      query: 'vibe'
+    })
+  })
+
+  it('routes /skills browse [page] to skills.manage with a numeric page', () => {
+    const ctx = buildCtx()
+
+    createSlashHandler(ctx)('/skills browse 3')
+    expect(ctx.gateway.rpc).toHaveBeenCalledWith('skills.manage', {
+      action: 'browse',
+      page: 3
+    })
+  })
+
+  it('shows usage for an unknown /skills subcommand', () => {
+    const ctx = buildCtx()
+
+    createSlashHandler(ctx)('/skills zzz')
+    expect(ctx.gateway.rpc).not.toHaveBeenCalled()
+    expect(ctx.transcript.sys).toHaveBeenCalledWith(expect.stringContaining('usage: /skills'))
+  })
+
   it('cycles details mode and persists it', async () => {
     const ctx = buildCtx()
 
@@ -151,6 +209,42 @@ describe('createSlashHandler', () => {
       expect(ctx.transcript.sys).toHaveBeenCalledWith('⚡ loading skill: hermes-agent-dev')
     })
     expect(ctx.transcript.send).toHaveBeenCalledWith(skillMessage)
+  })
+
+  it('/history pages the current TUI transcript (user + assistant)', () => {
+    const ctx = buildCtx({
+      local: {
+        ...buildLocal(),
+        getHistoryItems: vi.fn(() => [
+          { role: 'user', text: 'hello' },
+          { role: 'system', text: 'ignore me' },
+          { role: 'assistant', text: 'hi there' },
+          { role: 'user', text: 'test' }
+        ])
+      }
+    })
+
+    createSlashHandler(ctx)('/history')
+    expect(ctx.transcript.page).toHaveBeenCalledTimes(1)
+
+    const [body, title] = ctx.transcript.page.mock.calls[0]!
+
+    expect(title).toBe('History')
+    expect(body).toContain('[You #1]')
+    expect(body).toContain('hello')
+    expect(body).toContain('[Hermes #2]')
+    expect(body).toContain('hi there')
+    expect(body).toContain('[You #3]')
+    expect(body).not.toContain('ignore me')
+    expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
+  })
+
+  it('/history reports empty state without paging', () => {
+    const ctx = buildCtx()
+
+    createSlashHandler(ctx)('/history')
+    expect(ctx.transcript.page).not.toHaveBeenCalled()
+    expect(ctx.transcript.sys).toHaveBeenCalledWith('no conversation yet')
   })
 
   it('handles send-type dispatch for /plan command', async () => {

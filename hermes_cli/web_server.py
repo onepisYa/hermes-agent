@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import secrets
+import subprocess
 import sys
 import threading
 import time
@@ -70,6 +71,7 @@ app = FastAPI(title="Hermes Agent", version=__version__)
 # Injected into the SPA HTML so only the legitimate web UI can use it.
 # ---------------------------------------------------------------------------
 _SESSION_TOKEN = secrets.token_urlsafe(32)
+_SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
@@ -103,15 +105,115 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
 })
 
 
-def _require_token(request: Request) -> None:
-    """Validate the ephemeral session token.  Raises 401 on mismatch.
+def _has_valid_session_token(request: Request) -> bool:
+    """True if the request carries a valid dashboard session token.
 
-    Uses ``hmac.compare_digest`` to prevent timing side-channels.
+    The dedicated session header avoids collisions with reverse proxies that
+    already use ``Authorization`` (for example Caddy ``basic_auth``). We still
+    accept the legacy Bearer path for backward compatibility with older
+    dashboard bundles.
     """
+    session_header = request.headers.get(_SESSION_HEADER_NAME, "")
+    if session_header and hmac.compare_digest(
+        session_header.encode(),
+        _SESSION_TOKEN.encode(),
+    ):
+        return True
+
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {_SESSION_TOKEN}"
-    if not hmac.compare_digest(auth.encode(), expected.encode()):
+    return hmac.compare_digest(auth.encode(), expected.encode())
+
+
+def _require_token(request: Request) -> None:
+    """Validate the ephemeral session token.  Raises 401 on mismatch."""
+    if not _has_valid_session_token(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# Accepted Host header values for loopback binds. DNS rebinding attacks
+# point a victim browser at an attacker-controlled hostname (evil.test)
+# which resolves to 127.0.0.1 after a TTL flip — bypassing same-origin
+# checks because the browser now considers evil.test and our dashboard
+# "same origin". Validating the Host header at the app layer rejects any
+# request whose Host isn't one we bound for. See GHSA-ppp5-vxwm-4cf7.
+_LOOPBACK_HOST_VALUES: frozenset = frozenset({
+    "localhost", "127.0.0.1", "::1",
+})
+
+
+def _is_accepted_host(host_header: str, bound_host: str) -> bool:
+    """True if the Host header targets the interface we bound to.
+
+    Accepts:
+    - Exact bound host (with or without port suffix)
+    - Loopback aliases when bound to loopback
+    - Any host when bound to 0.0.0.0 (explicit opt-in to non-loopback,
+      no protection possible at this layer)
+    """
+    if not host_header:
+        return False
+    # Strip port suffix. IPv6 addresses use bracket notation:
+    #   [::1]         — no port
+    #   [::1]:9119    — with port
+    # Plain hosts/v4:
+    #   localhost:9119
+    #   127.0.0.1:9119
+    h = host_header.strip()
+    if h.startswith("["):
+        # IPv6 bracketed — port (if any) follows "]:"
+        close = h.find("]")
+        if close != -1:
+            host_only = h[1:close]  # strip brackets
+        else:
+            host_only = h.strip("[]")
+    else:
+        host_only = h.rsplit(":", 1)[0] if ":" in h else h
+    host_only = host_only.lower()
+
+    # 0.0.0.0 bind means operator explicitly opted into all-interfaces
+    # (requires --insecure per web_server.start_server). No Host-layer
+    # defence can protect that mode; rely on operator network controls.
+    if bound_host in ("0.0.0.0", "::"):
+        return True
+
+    # Loopback bind: accept the loopback names
+    bound_lc = bound_host.lower()
+    if bound_lc in _LOOPBACK_HOST_VALUES:
+        return host_only in _LOOPBACK_HOST_VALUES
+
+    # Explicit non-loopback bind: require exact host match
+    return host_only == bound_lc
+
+
+@app.middleware("http")
+async def host_header_middleware(request: Request, call_next):
+    """Reject requests whose Host header doesn't match the bound interface.
+
+    Defends against DNS rebinding: a victim browser on a localhost
+    dashboard is tricked into fetching from an attacker hostname that
+    TTL-flips to 127.0.0.1. CORS and same-origin checks don't help —
+    the browser now treats the attacker origin as same-origin with the
+    dashboard. Host-header validation at the app layer catches it.
+
+    See GHSA-ppp5-vxwm-4cf7.
+    """
+    # Store the bound host on app.state so this middleware can read it —
+    # set by start_server() at listen time.
+    bound_host = getattr(app.state, "bound_host", None)
+    if bound_host:
+        host_header = request.headers.get("host", "")
+        if not _is_accepted_host(host_header, bound_host):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": (
+                        "Invalid Host header. Dashboard requests must use "
+                        "the hostname the server was bound to."
+                    ),
+                },
+            )
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -119,9 +221,7 @@ async def auth_middleware(request: Request, call_next):
     """Require the session token on all /api/ routes except the public list."""
     path = request.url.path
     if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and not path.startswith("/api/plugins/"):
-        auth = request.headers.get("authorization", "")
-        expected = f"Bearer {_SESSION_TOKEN}"
-        if not hmac.compare_digest(auth.encode(), expected.encode()):
+        if not _has_valid_session_token(request):
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Unauthorized"},
@@ -232,8 +332,8 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "checkpoints": "agent",
     "approvals": "security",
     "human_delay": "display",
-    "smart_model_routing": "agent",
     "dashboard": "display",
+    "code_execution": "agent",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.
@@ -473,6 +573,138 @@ async def get_status():
         "gateway_exit_reason": gateway_exit_reason,
         "gateway_updated_at": gateway_updated_at,
         "active_sessions": active_sessions,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Gateway + update actions (invoked from the Status page).
+#
+# Both commands are spawned as detached subprocesses so the HTTP request
+# returns immediately.  stdin is closed (``DEVNULL``) so any stray ``input()``
+# calls fail fast with EOF rather than hanging forever.  stdout/stderr are
+# streamed to a per-action log file under ``~/.hermes/logs/<action>.log`` so
+# the dashboard can tail them back to the user.
+# ---------------------------------------------------------------------------
+
+_ACTION_LOG_DIR: Path = get_hermes_home() / "logs"
+
+# Short ``name`` (from the URL) → absolute log file path.
+_ACTION_LOG_FILES: Dict[str, str] = {
+    "gateway-restart": "gateway-restart.log",
+    "hermes-update": "hermes-update.log",
+}
+
+# ``name`` → most recently spawned Popen handle.  Used so ``status`` can
+# report liveness and exit code without shelling out to ``ps``.
+_ACTION_PROCS: Dict[str, subprocess.Popen] = {}
+
+
+def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
+    """Spawn ``hermes <subcommand>`` detached and record the Popen handle.
+
+    Uses the running interpreter's ``hermes_cli.main`` module so the action
+    inherits the same venv/PYTHONPATH the web server is using.
+    """
+    log_file_name = _ACTION_LOG_FILES[name]
+    _ACTION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = _ACTION_LOG_DIR / log_file_name
+    log_file = open(log_path, "ab", buffering=0)
+    log_file.write(
+        f"\n=== {name} started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode()
+    )
+
+    cmd = [sys.executable, "-m", "hermes_cli.main", *subcommand]
+
+    popen_kwargs: Dict[str, Any] = {
+        "cwd": str(PROJECT_ROOT),
+        "stdin": subprocess.DEVNULL,
+        "stdout": log_file,
+        "stderr": subprocess.STDOUT,
+        "env": {**os.environ, "HERMES_NONINTERACTIVE": "1"},
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    _ACTION_PROCS[name] = proc
+    return proc
+
+
+def _tail_lines(path: Path, n: int) -> List[str]:
+    """Return the last ``n`` lines of ``path``.  Reads the whole file — fine
+    for our small per-action logs.  Binary-decoded with ``errors='replace'``
+    so log corruption doesn't 500 the endpoint."""
+    if not path.exists():
+        return []
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return []
+    lines = text.splitlines()
+    return lines[-n:] if n > 0 else lines
+
+
+@app.post("/api/gateway/restart")
+async def restart_gateway():
+    """Kick off a ``hermes gateway restart`` in the background."""
+    try:
+        proc = _spawn_hermes_action(["gateway", "restart"], "gateway-restart")
+    except Exception as exc:
+        _log.exception("Failed to spawn gateway restart")
+        raise HTTPException(status_code=500, detail=f"Failed to restart gateway: {exc}")
+    return {
+        "ok": True,
+        "pid": proc.pid,
+        "name": "gateway-restart",
+    }
+
+
+@app.post("/api/hermes/update")
+async def update_hermes():
+    """Kick off ``hermes update`` in the background."""
+    try:
+        proc = _spawn_hermes_action(["update"], "hermes-update")
+    except Exception as exc:
+        _log.exception("Failed to spawn hermes update")
+        raise HTTPException(status_code=500, detail=f"Failed to start update: {exc}")
+    return {
+        "ok": True,
+        "pid": proc.pid,
+        "name": "hermes-update",
+    }
+
+
+@app.get("/api/actions/{name}/status")
+async def get_action_status(name: str, lines: int = 200):
+    """Tail an action log and report whether the process is still running."""
+    log_file_name = _ACTION_LOG_FILES.get(name)
+    if log_file_name is None:
+        raise HTTPException(status_code=404, detail=f"Unknown action: {name}")
+
+    log_path = _ACTION_LOG_DIR / log_file_name
+    tail = _tail_lines(log_path, min(max(lines, 1), 2000))
+
+    proc = _ACTION_PROCS.get(name)
+    if proc is None:
+        running = False
+        exit_code: Optional[int] = None
+        pid: Optional[int] = None
+    else:
+        exit_code = proc.poll()
+        running = exit_code is None
+        pid = proc.pid
+
+    return {
+        "name": name,
+        "running": running,
+        "exit_code": exit_code,
+        "pid": pid,
+        "lines": tail,
     }
 
 
@@ -1958,6 +2190,8 @@ async def update_config_raw(body: RawConfigUpdate):
 @app.get("/api/analytics/usage")
 async def get_usage_analytics(days: int = 30):
     from hermes_state import SessionDB
+    from agent.insights import InsightsEngine
+
     db = SessionDB()
     try:
         cutoff = time.time() - (days * 86400)
@@ -1969,7 +2203,8 @@ async def get_usage_analytics(days: int = 30):
                    SUM(reasoning_tokens) as reasoning_tokens,
                    COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
                    COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
-                   COUNT(*) as sessions
+                   COUNT(*) as sessions,
+                   SUM(COALESCE(api_call_count, 0)) as api_calls
             FROM sessions WHERE started_at > ?
             GROUP BY day ORDER BY day
         """, (cutoff,))
@@ -1980,7 +2215,8 @@ async def get_usage_analytics(days: int = 30):
                    SUM(input_tokens) as input_tokens,
                    SUM(output_tokens) as output_tokens,
                    COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
-                   COUNT(*) as sessions
+                   COUNT(*) as sessions,
+                   SUM(COALESCE(api_call_count, 0)) as api_calls
             FROM sessions WHERE started_at > ? AND model IS NOT NULL
             GROUP BY model ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
         """, (cutoff,))
@@ -1993,12 +2229,29 @@ async def get_usage_analytics(days: int = 30):
                    SUM(reasoning_tokens) as total_reasoning,
                    COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost,
                    COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,
-                   COUNT(*) as total_sessions
+                   COUNT(*) as total_sessions,
+                   SUM(COALESCE(api_call_count, 0)) as total_api_calls
             FROM sessions WHERE started_at > ?
         """, (cutoff,))
         totals = dict(cur3.fetchone())
+        insights_report = InsightsEngine(db).generate(days=days)
+        skills = insights_report.get("skills", {
+            "summary": {
+                "total_skill_loads": 0,
+                "total_skill_edits": 0,
+                "total_skill_actions": 0,
+                "distinct_skills_used": 0,
+            },
+            "top_skills": [],
+        })
 
-        return {"daily": daily, "by_model": by_model, "totals": totals, "period_days": days}
+        return {
+            "daily": daily,
+            "by_model": by_model,
+            "totals": totals,
+            "period_days": days,
+            "skills": skills,
+        }
     finally:
         db.close()
 
@@ -2065,8 +2318,134 @@ _BUILTIN_DASHBOARD_THEMES = [
 ]
 
 
+def _parse_theme_layer(value: Any, default_hex: str, default_alpha: float = 1.0) -> Optional[Dict[str, Any]]:
+    """Normalise a theme layer spec from YAML into `{hex, alpha}` form.
+
+    Accepts shorthand (a bare hex string) or full dict form.  Returns
+    ``None`` on garbage input so the caller can fall back to a built-in
+    default rather than blowing up.
+    """
+    if value is None:
+        return {"hex": default_hex, "alpha": default_alpha}
+    if isinstance(value, str):
+        return {"hex": value, "alpha": default_alpha}
+    if isinstance(value, dict):
+        hex_val = value.get("hex", default_hex)
+        alpha_val = value.get("alpha", default_alpha)
+        if not isinstance(hex_val, str):
+            return None
+        try:
+            alpha_f = float(alpha_val)
+        except (TypeError, ValueError):
+            alpha_f = default_alpha
+        return {"hex": hex_val, "alpha": max(0.0, min(1.0, alpha_f))}
+    return None
+
+
+_THEME_DEFAULT_TYPOGRAPHY: Dict[str, str] = {
+    "fontSans": 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+    "fontMono": 'ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace',
+    "baseSize": "15px",
+    "lineHeight": "1.55",
+    "letterSpacing": "0",
+}
+
+_THEME_DEFAULT_LAYOUT: Dict[str, str] = {
+    "radius": "0.5rem",
+    "density": "comfortable",
+}
+
+_THEME_OVERRIDE_KEYS = {
+    "card", "cardForeground", "popover", "popoverForeground",
+    "primary", "primaryForeground", "secondary", "secondaryForeground",
+    "muted", "mutedForeground", "accent", "accentForeground",
+    "destructive", "destructiveForeground", "success", "warning",
+    "border", "input", "ring",
+}
+
+
+def _normalise_theme_definition(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalise a user theme YAML into the wire format `ThemeProvider`
+    expects.  Returns ``None`` if the theme is unusable.
+
+    Accepts both the full schema (palette/typography/layout) and a loose
+    form with bare hex strings, so hand-written YAMLs stay friendly.
+    """
+    if not isinstance(data, dict):
+        return None
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+
+    # Palette
+    palette_src = data.get("palette", {}) if isinstance(data.get("palette"), dict) else {}
+    # Allow top-level `colors.background` as a shorthand too.
+    colors_src = data.get("colors", {}) if isinstance(data.get("colors"), dict) else {}
+
+    def _layer(key: str, default_hex: str, default_alpha: float = 1.0) -> Dict[str, Any]:
+        spec = palette_src.get(key, colors_src.get(key))
+        parsed = _parse_theme_layer(spec, default_hex, default_alpha)
+        return parsed if parsed is not None else {"hex": default_hex, "alpha": default_alpha}
+
+    palette = {
+        "background": _layer("background", "#041c1c", 1.0),
+        "midground": _layer("midground", "#ffe6cb", 1.0),
+        "foreground": _layer("foreground", "#ffffff", 0.0),
+        "warmGlow": palette_src.get("warmGlow") or data.get("warmGlow") or "rgba(255, 189, 56, 0.35)",
+        "noiseOpacity": 1.0,
+    }
+    raw_noise = palette_src.get("noiseOpacity", data.get("noiseOpacity"))
+    try:
+        palette["noiseOpacity"] = float(raw_noise) if raw_noise is not None else 1.0
+    except (TypeError, ValueError):
+        palette["noiseOpacity"] = 1.0
+
+    # Typography
+    typo_src = data.get("typography", {}) if isinstance(data.get("typography"), dict) else {}
+    typography = dict(_THEME_DEFAULT_TYPOGRAPHY)
+    for key in ("fontSans", "fontMono", "fontDisplay", "fontUrl", "baseSize", "lineHeight", "letterSpacing"):
+        val = typo_src.get(key)
+        if isinstance(val, str) and val.strip():
+            typography[key] = val
+
+    # Layout
+    layout_src = data.get("layout", {}) if isinstance(data.get("layout"), dict) else {}
+    layout = dict(_THEME_DEFAULT_LAYOUT)
+    radius = layout_src.get("radius")
+    if isinstance(radius, str) and radius.strip():
+        layout["radius"] = radius
+    density = layout_src.get("density")
+    if isinstance(density, str) and density in ("compact", "comfortable", "spacious"):
+        layout["density"] = density
+
+    # Color overrides — keep only valid keys with string values.
+    overrides_src = data.get("colorOverrides", {})
+    color_overrides: Dict[str, str] = {}
+    if isinstance(overrides_src, dict):
+        for key, val in overrides_src.items():
+            if key in _THEME_OVERRIDE_KEYS and isinstance(val, str) and val.strip():
+                color_overrides[key] = val
+
+    result: Dict[str, Any] = {
+        "name": name,
+        "label": data.get("label") or name,
+        "description": data.get("description", ""),
+        "palette": palette,
+        "typography": typography,
+        "layout": layout,
+    }
+    if color_overrides:
+        result["colorOverrides"] = color_overrides
+    return result
+
+
 def _discover_user_themes() -> list:
-    """Scan ~/.hermes/dashboard-themes/*.yaml for user-created themes."""
+    """Scan ~/.hermes/dashboard-themes/*.yaml for user-created themes.
+
+    Returns a list of fully-normalised theme definitions ready to ship
+    to the frontend, so the client can apply them without a secondary
+    round-trip or a built-in stub.
+    """
     themes_dir = get_hermes_home() / "dashboard-themes"
     if not themes_dir.is_dir():
         return []
@@ -2074,33 +2453,42 @@ def _discover_user_themes() -> list:
     for f in sorted(themes_dir.glob("*.yaml")):
         try:
             data = yaml.safe_load(f.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and data.get("name"):
-                result.append({
-                    "name": data["name"],
-                    "label": data.get("label", data["name"]),
-                    "description": data.get("description", ""),
-                })
         except Exception:
             continue
+        normalised = _normalise_theme_definition(data)
+        if normalised is not None:
+            result.append(normalised)
     return result
 
 
 @app.get("/api/dashboard/themes")
 async def get_dashboard_themes():
-    """Return available themes and the currently active one."""
+    """Return available themes and the currently active one.
+
+    Built-in entries ship name/label/description only (the frontend owns
+    their full definitions in `web/src/themes/presets.ts`).  User themes
+    from `~/.hermes/dashboard-themes/*.yaml` ship with their full
+    normalised definition under `definition`, so the client can apply
+    them without a stub.
+    """
     config = load_config()
     active = config.get("dashboard", {}).get("theme", "default")
     user_themes = _discover_user_themes()
-    # Merge built-in + user, user themes override built-in by name.
     seen = set()
     themes = []
     for t in _BUILTIN_DASHBOARD_THEMES:
         seen.add(t["name"])
         themes.append(t)
     for t in user_themes:
-        if t["name"] not in seen:
-            themes.append(t)
-            seen.add(t["name"])
+        if t["name"] in seen:
+            continue
+        themes.append({
+            "name": t["name"],
+            "label": t["label"],
+            "description": t["description"],
+            "definition": t,
+        })
+        seen.add(t["name"])
     return {"themes": themes, "active": active}
 
 
@@ -2305,13 +2693,15 @@ def start_server(
             "authentication. Only use on trusted networks.", host,
         )
 
+    # Record the bound host so host_header_middleware can validate incoming
+    # Host headers against it. Defends against DNS rebinding (GHSA-ppp5-vxwm-4cf7).
+    app.state.bound_host = host
+
     if open_browser:
-        import threading
         import webbrowser
 
         def _open():
-            import time as _t
-            _t.sleep(1.0)
+            time.sleep(1.0)
             webbrowser.open(f"http://{host}:{port}")
 
         threading.Thread(target=_open, daemon=True).start()
