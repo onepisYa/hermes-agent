@@ -87,7 +87,8 @@ def _get_session_db():
 
 def _qmd_query(query: str, limit: int = 10) -> QmdResult:
     """Call qmd CLI via subprocess. Runs on background thread (called from async)."""
-    import re, subprocess
+    import re
+    import subprocess
 
     try:
         # Use 'qmd search' for simpler BM25-only output (no LLM expansion needed)
@@ -148,7 +149,8 @@ def _qmd_query(query: str, limit: int = 10) -> QmdResult:
 
 def _hindsight_recall(query: str, bank_id: str = "hermes", budget: str = "mid", limit: int = 10) -> HindsightResult:
     """Call Hindsight recall on background thread (cloud via hindsight_client, local via hindsight)."""
-    import os, subprocess
+    import os
+    import subprocess
     from pathlib import Path
 
     try:
@@ -175,7 +177,6 @@ def _hindsight_recall(query: str, bank_id: str = "hermes", budget: str = "mid", 
                     capture_output=True, text=True, timeout=5,
                 )
                 if check.stdout.strip() == "200":
-                    api_base = f"http://localhost:{port}"
                     break
             else:
                 logger.warning("Fusion: hindsight-embed server not reachable on 9117/19177")
@@ -246,7 +247,6 @@ def _hindsight_retain(
                     capture_output=True, text=True, timeout=5,
                 )
                 if check_result.stdout.strip() == "200":
-                    api_base = f"http://localhost:{port}"
                     break
             else:
                 raise RuntimeError("Hindsight embedded server not reachable on 9177/19177")
@@ -376,8 +376,6 @@ def rrf_fuse(items: List[FusedItem], k: int = _RRF_K) -> List[FusedItem]:
 class FusionMemoryProvider(MemoryProvider):
     """Fuses Hindsight + qmd + SessionDB via second-level RRF."""
 
-    name: str = "fusion"
-
     def __init__(self) -> None:
         self._session_id: str = ""
         self._hindsight_bank: str = os.environ.get("HINDSIGHT_BANK_ID", "hermes")
@@ -459,22 +457,38 @@ class FusionMemoryProvider(MemoryProvider):
     def _sync_hindsight(self, user_content: str, assistant_content: str) -> None:
         """Retain turn to Hindsight."""
         try:
-            from hindsight import Hindsight
             from pathlib import Path
 
+            # Check both possible config locations (hermes profile vs raw .hindsight)
             cfg = {}
-            profile_path = Path.home() / ".hindsight" / "config.json"
-            if profile_path.exists():
-                cfg = json.loads(profile_path.read_text(encoding="utf-8"))
+            for config_path in [
+                Path.home() / ".hermes" / "hindsight" / "config.json",
+                Path.home() / ".hindsight" / "config.json",
+            ]:
+                if config_path.exists():
+                    cfg = json.loads(config_path.read_text(encoding="utf-8"))
+                    break
 
             api_key = cfg.get("apiKey") or cfg.get("api_key") or os.environ.get("HINDSIGHT_API_KEY", "")
             api_url = cfg.get("api_url") or os.environ.get("HINDSIGHT_API_URL", "")
             mode = cfg.get("mode", os.environ.get("HINDSIGHT_MODE", "cloud"))
 
             if mode == "local_embedded":
-                client: Any = Hindsight()
+                from hindsight.embedded import HindsightEmbedded
+
+                llm_provider = cfg.get("llm_provider", "minimax")
+                if llm_provider in ("openai_compatible", "openrouter"):
+                    llm_provider = "minimax"
+                client: Any = HindsightEmbedded(
+                    profile=self._hindsight_bank,
+                    llm_provider=llm_provider,
+                    llm_api_key=cfg.get("llmApiKey") or cfg.get("llm_api_key") or os.environ.get("HINDSIGHT_LLM_API_KEY", ""),
+                    llm_base_url=cfg.get("llm_base_url") or os.environ.get("HINDSIGHT_API_LLM_BASE_URL", ""),
+                )
             else:
-                client = Hindsight(base_url=api_url or None, api_key=api_key or None)
+                from hindsight import HindsightClient
+
+                client = HindsightClient(base_url=api_url or None, api_key=api_key or None)
 
             client.aretain(
                 bank_id=self._hindsight_bank,
