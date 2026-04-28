@@ -480,6 +480,19 @@ class FusionMemoryProvider(MemoryProvider):
             mode = cfg.get("mode", os.environ.get("HINDSIGHT_MODE", "cloud"))
 
             if mode == "local_embedded":
+                import site
+                # Prepend venv site-packages so hindsight.embedded resolves from venv,
+                # not from plugins/memory/hindsight/ (which shadows the real hindsight package)
+                venv_site = site.getsitepackages()[0]
+                import sys
+                # Remove any existing venv entries and re-insert at position 0
+                while venv_site in sys.path:
+                    sys.path.remove(venv_site)
+                sys.path.insert(0, venv_site)
+                # Remove plugin's hindsight from sys.modules so re-import finds venv version
+                for _k in list(sys.modules.keys()):
+                    if _k == "hindsight" or _k.startswith("hindsight."):
+                        del sys.modules[_k]
                 from hindsight.embedded import HindsightEmbedded
 
                 llm_provider = cfg.get("llm_provider", "minimax")
@@ -492,16 +505,26 @@ class FusionMemoryProvider(MemoryProvider):
                     llm_base_url=cfg.get("llm_base_url") or os.environ.get("HINDSIGHT_API_LLM_BASE_URL", ""),
                 )
             else:
+                import site
+                venv_site = site.getsitepackages()[0]
+                import sys
+                while venv_site in sys.path:
+                    sys.path.remove(venv_site)
+                sys.path.insert(0, venv_site)
+                for _k in list(sys.modules.keys()):
+                    if _k == "hindsight" or _k.startswith("hindsight."):
+                        del sys.modules[_k]
                 from hindsight import HindsightClient
 
                 client = HindsightClient(base_url=api_url or None, api_key=api_key or None)
 
-            client.aretain(
+            asyncio.run(client.aretain(
                 bank_id=self._hindsight_bank,
                 content=f"User: {user_content}\nAssistant: {assistant_content}",
                 context="conversation turn",
-            )
+            ))
             logger.info("Fusion hindsight retain succeeded for session=%s", self._session_id)
+            logger.debug("sys.path[0] in background thread: %s", sys.path[0])
         except Exception as e:
             logger.warning("Fusion hindsight retain failed: %s", e)
 
