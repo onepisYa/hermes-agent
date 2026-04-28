@@ -406,12 +406,18 @@ class FusionMemoryProvider(MemoryProvider):
         except Exception:
             qmd_ok = False
 
-        # Check Hindsight config
+        # Check Hindsight config — check both possible locations
         try:
             from pathlib import Path
 
-            profile_path = Path.home() / ".hindsight" / "config.json"
-            hindsight_cfg_ok = profile_path.exists()
+            hindsight_cfg_ok = False
+            for config_path in [
+                Path.home() / ".hermes" / "hindsight" / "config.json",
+                Path.home() / ".hindsight" / "config.json",
+            ]:
+                if config_path.exists():
+                    hindsight_cfg_ok = True
+                    break
         except Exception:
             hindsight_cfg_ok = False
 
@@ -495,8 +501,9 @@ class FusionMemoryProvider(MemoryProvider):
                 content=f"User: {user_content}\nAssistant: {assistant_content}",
                 context="conversation turn",
             )
+            logger.info("Fusion hindsight retain succeeded for session=%s", self._session_id)
         except Exception as e:
-            logger.debug("Fusion hindsight retain failed: %s", e)
+            logger.warning("Fusion hindsight retain failed: %s", e)
 
     def _sync_sessiondb(self, user_content: str, assistant_content: str, session_id: str) -> None:
         """Insert turn into SessionDB."""
