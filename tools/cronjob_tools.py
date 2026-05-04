@@ -11,7 +11,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from hermes_constants import display_hermes_home
 
@@ -128,6 +128,15 @@ def _resolve_model_override(model_obj: Optional[Dict[str, Any]]) -> tuple:
         return (None, None)
     model_name = (model_obj.get("model") or "").strip() or None
     provider_name = (model_obj.get("provider") or "").strip() or None
+    # Bare "custom" is an incomplete spec — the canonical form is
+    # "custom:<name>" matching a custom_providers entry. LLMs frequently
+    # supply the bare type because the schema does not advertise the
+    # ":<name>" suffix, which used to bypass the pinning path below and
+    # leave the job stored with an unresolvable "custom" provider. Treat
+    # the bare value as "no provider supplied" so the current main
+    # provider gets pinned instead.
+    if provider_name == "custom":
+        provider_name = None
     if model_name and not provider_name:
         # Pin to the current main provider so the job is stable
         try:
@@ -147,6 +156,27 @@ def _normalize_optional_job_value(value: Optional[Any], *, strip_trailing_slash:
     text = str(value).strip()
     if strip_trailing_slash:
         text = text.rstrip("/")
+    return text or None
+
+
+def _normalize_deliver_param(value: Any) -> Optional[str]:
+    """Normalize a user-supplied ``deliver`` value to the canonical string form.
+
+    The cron schema documents ``deliver`` as a string (``"local"``, ``"origin"``,
+    ``"telegram"``, ``"telegram:chat_id[:thread_id]"``, or comma-separated combos).
+    Some callers — MCP clients passing arrays, scripts building the payload as a
+    list — supply ``["telegram"]``.  ``create_job``/``update_job`` store it as-is,
+    and the scheduler's ``str(deliver).split(",")`` then serializes the list to
+    the literal ``"['telegram']"`` which is not a known platform.  Flatten lists
+    / tuples at the API boundary so storage is always a string.  Returns ``None``
+    for ``None``/empty so callers can treat it as "not supplied".
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        parts = [str(p).strip() for p in value if str(p).strip()]
+        return ",".join(parts) if parts else None
+    text = str(value).strip()
     return text or None
 
 
@@ -238,6 +268,7 @@ def cronjob(
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
     script: Optional[str] = None,
+    context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     task_id: str = None,
@@ -265,18 +296,31 @@ def cronjob(
                 if script_error:
                     return tool_error(script_error, success=False)
 
+            # Validate context_from references existing jobs
+            if context_from:
+                from cron.jobs import get_job as _get_job
+                refs = [context_from] if isinstance(context_from, str) else context_from
+                for ref_id in refs:
+                    if not _get_job(ref_id):
+                        return tool_error(
+                            f"context_from job '{ref_id}' not found. "
+                            "Use cronjob(action='list') to see available jobs.",
+                            success=False,
+                        )
+
             job = create_job(
                 prompt=prompt or "",
                 schedule=schedule,
                 name=name,
                 repeat=repeat,
-                deliver=deliver,
+                deliver=_normalize_deliver_param(deliver),
                 origin=_origin_from_env(),
                 skills=canonical_skills,
                 model=_normalize_optional_job_value(model),
                 provider=_normalize_optional_job_value(provider),
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                 script=_normalize_optional_job_value(script),
+                context_from=context_from,
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
             )
@@ -350,7 +394,7 @@ def cronjob(
             if name is not None:
                 updates["name"] = name
             if deliver is not None:
-                updates["deliver"] = deliver
+                updates["deliver"] = _normalize_deliver_param(deliver)
             if skills is not None or skill is not None:
                 canonical_skills = _canonical_skills(skill, skills)
                 updates["skills"] = canonical_skills
@@ -368,6 +412,24 @@ def cronjob(
                     if script_error:
                         return tool_error(script_error, success=False)
                 updates["script"] = _normalize_optional_job_value(script) if script else None
+            if context_from is not None:
+                # Empty string / empty list clears the field; otherwise validate
+                # each referenced job exists before storing. Normalized to a list
+                # (or None) to match the shape stored by create_job().
+                if isinstance(context_from, str):
+                    refs = [context_from.strip()] if context_from.strip() else []
+                else:
+                    refs = [str(j).strip() for j in context_from if str(j).strip()]
+                if refs:
+                    from cron.jobs import get_job as _get_job
+                    for ref_id in refs:
+                        if not _get_job(ref_id):
+                            return tool_error(
+                                f"context_from job '{ref_id}' not found. "
+                                "Use cronjob(action='list') to see available jobs.",
+                                success=False,
+                            )
+                updates["context_from"] = refs or None
             if enabled_toolsets is not None:
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if workdir is not None:
@@ -460,7 +522,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "properties": {
                     "provider": {
                         "type": "string",
-                        "description": "Provider name (e.g. 'openrouter', 'anthropic'). Omit to use and pin the current provider."
+                        "description": "Provider name (e.g. 'openrouter', 'anthropic', or 'custom:<name>' for a provider defined in custom_providers config — always include the ':<name>' suffix, never pass the bare 'custom'). Omit to use and pin the current provider."
                     },
                     "model": {
                         "type": "string",
@@ -472,6 +534,19 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             "script": {
                 "type": "string",
                 "description": f"Optional path to a Python script that runs before each cron job execution. Its stdout is injected into the prompt as context. Use for data collection and change detection. Relative paths resolve under {display_hermes_home()}/scripts/. On update, pass empty string to clear."
+            },
+            "context_from": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional job ID or list of job IDs whose most recent completed output is "
+                    "injected into the prompt as context before each run. "
+                    "Use this to chain cron jobs: job A collects data, job B processes it. "
+                    "Each entry must be a valid job ID (from cronjob action='list'). "
+                    "Note: injects the most recent completed output — does not wait for "
+                    "upstream jobs running in the same tick. "
+                    "On update, pass an empty array to clear."
+                ),
             },
             "enabled_toolsets": {
                 "type": "array",
@@ -526,6 +601,7 @@ registry.register(
         base_url=args.get("base_url"),
         reason=args.get("reason"),
         script=args.get("script"),
+        context_from=args.get("context_from"),
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         task_id=kw.get("task_id"),
