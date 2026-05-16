@@ -69,4 +69,16 @@ mini-swe-agent/
 .nix-stamps/
 result
 website/static/api/skills-index.json
+<<<<<<< HEAD
 .omx/
+=======
+models-dev-upstream/
+hermes_cli/tui_dist/*
+hermes_cli/scripts/
+docs/superpowers/*
+>>>>>>> upstream/main
+.omx/
+models-dev-upstream/
+hermes_cli/tui_dist/*
+hermes_cli/scripts/
+docs/superpowers/*
