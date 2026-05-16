@@ -89,7 +89,6 @@ qmd status
 | `qmd multi-get "glob"` | Retrieve multiple files | instant |
 | `qmd collection add <path> --name <n>` | Add a directory as a collection | instant |
 | `qmd context add <path> "description"` | Add context metadata to improve retrieval | instant |
-| `qmd embed` | Generate/update vector embeddings | varies |
 | `qmd status` | Show index health and collection info | instant |
 | `qmd mcp` | Start MCP server (stdio) | persistent |
 | `qmd mcp --http --daemon` | Start MCP server (HTTP, warm models) | persistent |
@@ -127,12 +126,8 @@ qmd context add qmd://meetings "Meeting transcripts and action items from team s
 
 ### 3. Generate Embeddings
 
-```bash
-qmd embed
-```
-
-This processes all documents in all collections and generates vector
-embeddings. Re-run after adding new documents or collections.
+> ⚠️ **Disabled** — `qmd embed` is disabled due to CPU/embedding cost.
+> Use `qmd search` (BM25 keyword, zero LLM dependency) for all retrieval needs.
 
 ### 4. Verify
 
@@ -364,7 +359,6 @@ For setup and management tasks, always use terminal:
 ```
 terminal(command="qmd collection add ~/Documents/notes --name notes")
 terminal(command="qmd context add qmd://notes 'Personal research notes and ideas'")
-terminal(command="qmd embed")
 terminal(command="qmd status")
 ```
 
@@ -390,8 +384,7 @@ blocks are never split mid-block.
 
 1. **Always add context descriptions** — `qmd context add` dramatically
    improves retrieval accuracy. Describe what each collection contains.
-2. **Re-embed after adding documents** — `qmd embed` must be re-run when
-   new files are added to collections.
+2. **BM25 auto-indexes** — `qmd search` uses SQLite FTS5; run `qmd update` to rebuild the keyword index after adding files.
 3. **Use `qmd search` for speed** — when you need fast keyword lookup
    (code identifiers, exact names), BM25 is instant and needs no models.
 4. **Use `qmd query` for quality** — when the question is conceptual or
@@ -420,10 +413,10 @@ Install Homebrew SQLite: `brew install sqlite`
 Then ensure it's on PATH before system SQLite.
 
 ### "No collections found"
-Run `qmd collection add <path> --name <name>` to add directories,
-then `qmd embed` to index them.
+Run `qmd collection add <path> --name <name>` to add directories.
+BM25 keyword search works immediately; `qmd update` rebuilds the index.
 
-### Embedding model override (CJK/multilingual)
+### ⚠️ Embedding model override (CJK/multilingual) — Disabled
 Set `QMD_EMBED_MODEL` environment variable for non-English content:
 ```bash
 export QMD_EMBED_MODEL="your-multilingual-model"
