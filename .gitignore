@@ -13,21 +13,12 @@ __pycache__/
 .env.production.local
 .env.development
 .env.test
-.hermes-docker/
-.notebooklm-home/
-.notebooklm-cli-venv/
-.notebooklm-playwright/
-.pip-cache/
-.uv-cache/
-compose.hermes.local.yml
 export*
 __pycache__/model_tools.cpython-310.pyc
 __pycache__/web_tools.cpython-310.pyc
 logs/
 data/
 .pytest_cache/
-test_durations.json
-.pytest-cache/
 tmp/
 temp_vision_images/
 hermes-*/*
@@ -90,8 +81,14 @@ website/static/api/skills-index.json
 # every build).
 website/static/api/skills.json
 website/static/api/skills-meta.json
+
+# Fork-specific ignores (onepisya-dev)
 .omx/
+.omc
 models-dev-upstream/
+hermes_cli/tui_dist/*
+hermes_cli/scripts/*
+docs/superpowers/*
 
 # Local editor / agent tooling (machine-specific; keep in global config, not the repo)
 .codex/
@@ -101,11 +98,6 @@ models-dev-upstream/
 .mcp.json
 opencode.json
 config/mcporter.json
-
-hermes_cli/tui_dist/*
-hermes_cli/scripts/
-docs/superpowers/*
-.omc
 
 # Working directory for the Hermes Agent's session state (~/.hermes/ at runtime;
 # also created in-repo when an agent operates in this checkout). Plans, audit
