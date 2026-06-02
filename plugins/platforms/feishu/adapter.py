@@ -162,7 +162,7 @@ _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
-_POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+_POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect|content format of the interactive (?:card|message) is incorrect|invalid card content|invalid interactive content|invalid (?:card|interactive) payload|field validation failed.*(?:card|interactive)|(?:card|interactive).*field validation failed", re.IGNORECASE)
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -1795,7 +1795,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 except Exception as exc:
-                    if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
+                    if msg_type not in {"post", "interactive"} or not _POST_CONTENT_INVALID_RE.search(str(exc)):
                         raise
                     logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
                     response = await self._feishu_send_with_retry(
@@ -1806,7 +1806,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 if (
-                    msg_type == "post"
+                    msg_type in {"post", "interactive"}
                     and not self._response_succeeded(response)
                     and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
                 ):
@@ -1844,7 +1844,7 @@ class FeishuAdapter(BasePlatformAdapter):
             request = self._build_update_message_request(message_id=message_id, request_body=body)
             response = await asyncio.to_thread(self._client.im.v1.message.update, request)
             result = self._finalize_send_result(response, "update failed")
-            if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
+            if not result.success and msg_type in {"post", "interactive"} and _POST_CONTENT_INVALID_RE.search(result.error or ""):
                 logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
                 fallback_body = self._build_update_message_body(
                     msg_type="text",
@@ -2830,7 +2830,7 @@ class FeishuAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
-            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type="group"),
+            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=str(chat_info.get("type") or "p2p")),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
             thread_id=None,
@@ -4612,7 +4612,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 return response
             except Exception as exc:
                 last_error = exc
-                if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):
+                if msg_type in {"post", "interactive"} and _POST_CONTENT_INVALID_RE.search(str(exc)):
                     raise
                 if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
                     raise
