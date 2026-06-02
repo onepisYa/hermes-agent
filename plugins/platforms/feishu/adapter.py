@@ -2633,7 +2633,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if CallBackCard is not None:
             card = CallBackCard()
             card.type = "raw"
-            card.data = self._build_resolved_approval_card(choice=choice, user_name=user_name)
+            card.data = json.dumps(self._build_resolved_approval_card(choice=choice, user_name=user_name), ensure_ascii=False)
             response.card = card
         return response
 
@@ -2668,7 +2668,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if CallBackCard is not None:
             card = CallBackCard()
             card.type = "raw"
-            card.data = self._build_resolved_update_prompt_card(answer=answer, user_name=user_name)
+            card.data = json.dumps(self._build_resolved_update_prompt_card(answer=answer, user_name=user_name), ensure_ascii=False)
             response.card = card
         return response
 
