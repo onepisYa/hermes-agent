@@ -1436,6 +1436,96 @@ def test_opencode_go_model_derivation_beats_stale_persisted_api_mode(monkeypatch
     assert resolved["api_mode"] == "anthropic_messages"
 
 
+# ------------------------------------------------------------------
+# fix minimax stale api_mode — hermes-agent#16878 family
+# MiniMax API-key providers (minimax / minimax-cn) serve the canonical
+# /anthropic endpoint with the Anthropic Messages protocol.  A persisted
+# `api_mode: chat_completions` from a prior provider (e.g. opencode-go)
+# would otherwise leak through and route /chat/completions under
+# /anthropic — the MiniMax gateway returns a bare nginx 404 in that
+# case.  The fix re-derives api_mode from the URL convention when the
+# persisted value belongs to a different provider family, mirroring how
+# opencode-zen/opencode-go already protect themselves.  Refs #16878.
+# ------------------------------------------------------------------
+
+
+def test_minimax_re_derives_stale_chat_completions_from_opencode_go(monkeypatch):
+    """minimax with default /anthropic URL must use anthropic_messages
+    even when the persisted api_mode=chat_completions leaked from a prior
+    opencode-go session (the canonical real-world failure mode of issue
+    #16878).  Refs #16878.
+    """
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "minimax")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            # configured_provider=opencode-go is the stale state — user
+            # previously used opencode-go, then switched to minimax but
+            # model.yaml still records the old provider + api_mode.
+            "provider": "opencode-go",
+            "default": "MiniMax-M2.7",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-key")
+    monkeypatch.delenv("MINIMAX_BASE_URL", raising=False)
+
+    resolved = rp.resolve_runtime_provider(requested="minimax")
+
+    assert resolved["provider"] == "minimax"
+    assert resolved["api_mode"] == "anthropic_messages", (
+        "minimax /anthropic endpoint must derive anthropic_messages; "
+        "a stale chat_completions from a prior opencode-go session cannot "
+        "leak through (Refs #16878)."
+    )
+
+
+def test_minimax_cn_re_derives_stale_chat_completions_from_opencode_go(monkeypatch):
+    """minimax-cn with default /anthropic URL must use anthropic_messages
+    even when the persisted api_mode=chat_completions leaked from a prior
+    opencode-go session.  Refs #16878.
+    """
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "minimax-cn")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "opencode-go",
+            "default": "MiniMax-M2.7",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "test-minimax-cn-key")
+    monkeypatch.delenv("MINIMAX_CN_BASE_URL", raising=False)
+
+    resolved = rp.resolve_runtime_provider(requested="minimax-cn")
+
+    assert resolved["provider"] == "minimax-cn"
+    assert resolved["api_mode"] == "anthropic_messages", (
+        "minimax-cn /anthropic endpoint must derive anthropic_messages; "
+        "a stale chat_completions from a prior opencode-go session cannot "
+        "leak through (Refs #16878)."
+    )
+
+
+def test_minimax_v1_override_still_uses_chat_completions(monkeypatch):
+    """Backward compat: minimax with user-override /v1 base URL still uses
+    chat_completions — the explicit /v1 override is honored, not the
+    canonical /anthropic derivation.  Refs #16878.
+    """
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "minimax")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-key")
+    monkeypatch.setenv("MINIMAX_BASE_URL", "https://api.minimax.chat/v1")
+
+    resolved = rp.resolve_runtime_provider(requested="minimax")
+
+    assert resolved["provider"] == "minimax"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["base_url"] == "https://api.minimax.chat/v1"
+
+
 def test_named_custom_provider_anthropic_api_mode(monkeypatch):
     """Custom providers should accept api_mode: anthropic_messages."""
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "my-anthropic-proxy")

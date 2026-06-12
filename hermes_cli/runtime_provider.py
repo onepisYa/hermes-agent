@@ -393,7 +393,43 @@ def _resolve_runtime_from_pool_entry(
             if cfg_base_url:
                 base_url = cfg_base_url
         configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-        if provider in {"opencode-zen", "opencode-go"}:
+        if provider in {"minimax", "minimax-cn"}:
+            # MiniMax API-key providers serve the canonical /anthropic
+            # endpoint with the Anthropic Messages protocol.  When the base
+            # URL is the provider default (/anthropic) — i.e. the user has
+            # not overridden it — re-derive to anthropic_messages if the
+            # persisted `api_mode` is not a user-supplied explicit value
+            # belonging to the same provider family.  This prevents:
+            #   1. a stale `api_mode: chat_completions` from a prior
+            #      OpenAI-compatible provider (e.g. opencode-go) leaking
+            #      through and routing /chat/completions under /anthropic
+            #      (the MiniMax gateway returns a bare nginx 404), and
+            #   2. an explicit `api_mode: chat_completions` accidentally
+            #      matching the wrong base URL convention.
+            # When the user has explicitly configured both `provider` and
+            # `api_mode` together for the same provider, their intent is
+            # honored (preserves backward-compat for users in regions where
+            # /anthropic 404s and who have set `api_mode: chat_completions`
+            # alongside a `model.base_url: /v1` override).  Refs #16878.
+            detected = _detect_api_mode_for_url(base_url)
+            same_provider_explicit = bool(
+                configured_mode
+                and _provider_supports_explicit_api_mode(provider, configured_provider)
+            )
+            if (
+                pool_url_is_default
+                and detected == "anthropic_messages"
+                and not same_provider_explicit
+            ):
+                api_mode = "anthropic_messages"
+            elif same_provider_explicit:
+                api_mode = configured_mode
+            elif detected:
+                api_mode = detected
+            # else: no URL detect, no valid explicit mode — keep the
+            # line 308 default "chat_completions" (preserves /v1 override
+            # backward compat for users in regions where /anthropic 404s).
+        elif provider in {"opencode-zen", "opencode-go"}:
             # Re-derive api_mode from the effective model rather than the
             # persisted api_mode: the opencode providers serve both
             # anthropic_messages and chat_completions models, so the previous
