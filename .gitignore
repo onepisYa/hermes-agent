@@ -137,3 +137,19 @@ RELEASE_v*.md
 # Desktop demo-run scratch output (hermes writes demo/*.txt during recorded
 # walkthroughs). Throwaway artifacts, never part of the app.
 apps/desktop/demo/
+
+# Fork-specific ignores (onepisya-dev)
+.omx/
+.omc
+hermes_cli/tui_dist/*
+hermes_cli/scripts/*
+docs/superpowers/*
+
+# Local editor / agent tooling (machine-specific; keep in global config, not the repo)
+.codex/
+.cursor/
+.gemini/
+.zed/
+.mcp.json
+opencode.json
+config/mcporter.json
