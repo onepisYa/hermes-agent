@@ -142,6 +142,7 @@ export const af: Translations = {
     sessionDeleted: "Sessie geskrap",
     failedToDelete: "Kon nie sessie skrap nie",
     resumeInChat: "Hervat in Klets",
+    newChat: "Nuwe klets",
     previousPage: "Vorige bladsy",
     nextPage: "Volgende bladsy",
     roles: {
@@ -235,8 +236,8 @@ export const af: Translations = {
     nameRequired: "Naam word vereis",
     nameRule:
       "Slegs kleinletters, syfers, _ en -; moet met 'n letter of syfer begin; tot 64 karakters.",
-    invalidName: "Ongeldige profielnaam",
-    cloneFromDefault: "Kloon konfigurasie vanaf verstekprofiel",
+    invalidName: "Ongeldige profielnaam",    cloneFrom: "Kloon konfigurasie vanaf profiel",
+    cloneFromNone: "Geen (leeg)",
     allProfiles: "Profiele",
     noProfiles: "Geen profiele gevind nie.",
     defaultBadge: "verstek",

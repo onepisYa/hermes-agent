@@ -13,7 +13,9 @@ import type { SkillInfo, ToolsetInfo } from '@/types/hermes'
 
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
 import { PageSearchShell } from '../page-search-shell'
-import { asText, includesQuery, prettyName, toolNames } from '../settings/helpers'
+import { ComputerUsePanel } from '../settings/computer-use-panel'
+import { asText, includesQuery, prettyName, toolNames, toolsetDisplayLabel } from '../settings/helpers'
+import { ToolsetConfigPanel } from '../settings/toolset-config-panel'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 
 const SKILLS_MODES = ['skills', 'toolsets'] as const
@@ -275,6 +277,10 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
                           ))}
                         </div>
                       )}
+                      {expanded && toolset.name === 'computer_use' && (
+                        <ComputerUsePanel onConfiguredChange={refreshToolsets} />
+                      )}
+                      {expanded && <ToolsetConfigPanel onConfiguredChange={refreshToolsets} toolset={toolset.name} />}
                     </div>
                   )
                 })}

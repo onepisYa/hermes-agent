@@ -10,7 +10,9 @@ import {
   $updateChecking,
   $updateStatus,
   checkUpdates,
-  openUpdatesWindow
+  openUpdatesWindow,
+  refreshDesktopVersion,
+  startActiveUpdate
 } from '@/store/updates'
 
 import { ListRow, SectionHeading, SettingsContent } from './primitives'
@@ -129,9 +131,14 @@ export function AboutSettings() {
             </Button>
 
             {behind > 0 && supported && !applying && (
-              <Button onClick={() => openUpdatesWindow()} size="sm">
-                See what&apos;s new
-              </Button>
+              <>
+                <Button onClick={() => startActiveUpdate()} size="sm">
+                  {a.updateNow}
+                </Button>
+                <Button onClick={() => openUpdatesWindow()} size="sm" variant="textStrong">
+                  {a.seeWhatsNew}
+                </Button>
+              </>
             )}
 
             <Button

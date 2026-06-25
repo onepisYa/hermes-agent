@@ -20,6 +20,10 @@ import { cn, themedBody } from "@/lib/utils";
 
 type Transport = "http" | "stdio";
 
+function isHttpUrl(value: string): boolean {
+  return /^https?:\/\//i.test(value.trim());
+}
+
 function truncateText(value: string, maxLength: number): string {
   return value.length > maxLength ? value.slice(0, maxLength) + "..." : value;
 }
@@ -435,6 +439,166 @@ export default function McpPage() {
                   >
                     <Trash2 />
                   </Button>
+                </div>
+              </CardContent>
+            </Card>
+          );
+        })}
+      </div>
+
+      {/* ── Catalog ── */}
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+          <H2
+            variant="sm"
+            className="flex items-center gap-2 text-muted-foreground"
+          >
+            <Package className="h-4 w-4" />
+            Catalog ({catalog.length})
+          </H2>
+        </div>
+
+        <p className="text-xs text-muted-foreground">
+          Browse Nous-approved MCP servers and install them with one click.
+        </p>
+
+        {catalog.length === 0 && (
+          <Card>
+            <CardContent className="py-8 text-center text-sm text-muted-foreground">
+              No catalog entries available.
+            </CardContent>
+          </Card>
+        )}
+
+        {catalog.map((entry) => {
+          const entryDiags = diagnosticsByName[entry.name] ?? [];
+          const isInstalling = installingName === entry.name;
+
+          return (
+            <Card key={entry.name}>
+              <CardContent className="flex items-start gap-4 py-4">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 mb-1 flex-wrap">
+                    <span className="font-medium text-sm truncate">
+                      {entry.name}
+                    </span>
+                    <Badge
+                      tone={TRANSPORT_TONE[entry.transport] ?? "secondary"}
+                    >
+                      {entry.transport}
+                    </Badge>
+                    <Badge tone="outline">auth: {entry.auth_type}</Badge>
+                    {isHttpUrl(entry.source) ? (
+                      <a
+                        href={entry.source}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs text-primary underline underline-offset-2 hover:opacity-80"
+                      >
+                        source ↗
+                      </a>
+                    ) : (
+                      entry.source && (
+                        <Badge tone="outline">{entry.source}</Badge>
+                      )
+                    )}
+                    {entry.installed && (
+                      <Badge tone="success">Installed</Badge>
+                    )}
+                    {entry.installed && !entry.enabled && (
+                      <Badge tone="outline">disabled</Badge>
+                    )}
+                  </div>
+                  {entry.description && (
+                    <p className="text-xs text-muted-foreground">
+                      {entry.description}
+                    </p>
+                  )}
+                  {/* Connection detail: what the agent actually talks to. */}
+                  {entry.transport === "http" && entry.url && (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      <span className="font-medium">Endpoint:</span>{" "}
+                      <code className="font-mono">{entry.url}</code>
+                    </p>
+                  )}
+                  {entry.transport === "stdio" && entry.command && (
+                    <p className="mt-1 text-xs text-muted-foreground break-all">
+                      <span className="font-medium">Runs:</span>{" "}
+                      <code className="font-mono">
+                        {[entry.command, ...entry.args].join(" ")}
+                      </code>
+                    </p>
+                  )}
+                  {/* Git bootstrap — surfaced so users see what gets cloned/run
+                      before they install (matches the docs trust model). */}
+                  {entry.install_url && (
+                    <p className="mt-1 text-xs text-muted-foreground break-all">
+                      <span className="font-medium">Installs from:</span>{" "}
+                      {isHttpUrl(entry.install_url) ? (
+                        <a
+                          href={entry.install_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-primary underline underline-offset-2 hover:opacity-80"
+                        >
+                          {entry.install_url}
+                        </a>
+                      ) : (
+                        <code className="font-mono">{entry.install_url}</code>
+                      )}
+                      {entry.install_ref && (
+                        <span> @ {entry.install_ref}</span>
+                      )}
+                    </p>
+                  )}
+                  {entry.bootstrap.length > 0 && (
+                    <details className="mt-1 text-xs text-muted-foreground">
+                      <summary className="cursor-pointer select-none">
+                        Bootstrap commands ({entry.bootstrap.length})
+                      </summary>
+                      <ul className="mt-1 ml-3 list-disc space-y-0.5">
+                        {entry.bootstrap.map((cmd, i) => (
+                          <li key={`${entry.name}-bs-${i}`} className="break-all">
+                            <code className="font-mono">{cmd}</code>
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
+                  )}
+                  {entry.post_install && (
+                    <details className="mt-1 text-xs text-muted-foreground">
+                      <summary className="cursor-pointer select-none">
+                        Setup notes
+                      </summary>
+                      <p className="mt-1 whitespace-pre-wrap">
+                        {entry.post_install.trim()}
+                      </p>
+                    </details>
+                  )}
+                  {entryDiags.map((d, i) => (
+                    <p
+                      key={`${entry.name}-diag-${i}`}
+                      className="text-xs text-warning mt-1"
+                    >
+                      {d.message}
+                    </p>
+                  ))}
+                </div>
+
+                <div className="flex items-center gap-1 shrink-0">
+                  {entry.installed ? (
+                    <Badge tone="success">Installed</Badge>
+                  ) : (
+                    <Button
+                      className="uppercase"
+                      size="sm"
+                      onClick={() => handleInstallClick(entry)}
+                      disabled={isInstalling}
+                      prefix={isInstalling ? <Spinner /> : undefined}
+                    >
+                      {isInstalling ? "Installing..." : "Install"}
+                    </Button>
+                  )}
                 </div>
               </CardContent>
             </Card>

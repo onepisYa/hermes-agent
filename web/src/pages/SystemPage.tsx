@@ -266,6 +266,113 @@ export default function SystemPage() {
     }
   };
 
+  // ── Debug share ────────────────────────────────────────────────────
+  // Unlike the fire-and-forget ops above, `debug share` produces shareable
+  // paste URLs that are the whole point — so we surface them as real,
+  // copyable links rather than a log tail.
+  const [shareRedact, setShareRedact] = useState(true);
+  const [sharing, setSharing] = useState(false);
+  const [shareResult, setShareResult] = useState<DebugShareResponse | null>(
+    null,
+  );
+  const [copiedLabel, setCopiedLabel] = useState<string | null>(null);
+
+  const copyToClipboard = useCallback(
+    async (text: string, label: string) => {
+      try {
+        await navigator.clipboard.writeText(text);
+        setCopiedLabel(label);
+        setTimeout(
+          () => setCopiedLabel((cur) => (cur === label ? null : cur)),
+          1500,
+        );
+      } catch {
+        showToast("Couldn't copy to clipboard", "error");
+      }
+    },
+    [showToast],
+  );
+
+  const runDebugShare = useCallback(async () => {
+    setSharing(true);
+    setShareResult(null);
+    try {
+      const res = await api.runDebugShare({ redact: shareRedact });
+      setShareResult(res);
+      const n = Object.keys(res.urls).length;
+      showToast(
+        `Uploaded ${n} paste${n === 1 ? "" : "s"}${
+          res.redacted ? " (redacted)" : ""
+        }`,
+        "success",
+      );
+    } catch (e) {
+      showToast(`Debug share failed: ${e}`, "error");
+    } finally {
+      setSharing(false);
+    }
+  }, [shareRedact, showToast]);
+
+
+  // ── Update check / apply ───────────────────────────────────────────
+  const checkForUpdate = useCallback(
+    async (force = false) => {
+      if (status?.can_update_hermes === false) return;
+      setCheckingUpdate(true);
+      try {
+        const info = await api.checkHermesUpdate(force);
+        setUpdateInfo(info);
+        if (force) {
+          if (info.update_available) {
+            showToast(
+              info.behind && info.behind > 0
+                ? `Update available — ${info.behind} commit${info.behind === 1 ? "" : "s"} behind`
+                : "Update available",
+              "success",
+            );
+          } else if (info.behind === 0) {
+            showToast("You're on the latest version", "success");
+          } else if (info.message) {
+            showToast(info.message, "error");
+          }
+        }
+      } catch (e) {
+        showToast(`Update check failed: ${e}`, "error");
+      } finally {
+        setCheckingUpdate(false);
+      }
+    },
+    [showToast, status?.can_update_hermes],
+  );
+
+  // Auto-check (cached) runs inside loadAll on mount; this is the
+  // user-triggered forced re-check from the "Check for updates" button.
+  const applyUpdate = async () => {
+    setUpdateConfirmOpen(false);
+    if (status?.can_update_hermes === false) {
+      showToast(
+        "Hermes updates are managed outside this dashboard.",
+        "success",
+      );
+      return;
+    }
+    try {
+      const resp = await api.updateHermes();
+      if (!resp.ok) {
+        showToast(
+          resp.message ??
+            "Updates don't apply from this dashboard.",
+          "success",
+        );
+        return;
+      }
+      setActiveAction(resp.name ?? "hermes-update");
+      showToast("Update started", "success");
+    } catch (e) {
+      showToast(`Update failed: ${e}`, "error");
+    }
+  };
+
   const checkpointsPrune = useConfirmDelete({
     onDelete: useCallback(async () => {
       try {
@@ -288,10 +395,27 @@ export default function SystemPage() {
   }
 
   const gatewayRunning = status?.gateway_running;
+  const canUpdateHermes = status?.can_update_hermes !== false;
+  const validEvents = hooks?.valid_events?.length
+    ? hooks.valid_events
+    : HOOK_EVENTS_FALLBACK;
 
   return (
     <div className="flex flex-col gap-8">
       <Toast toast={toast} />
+
+      <ConfirmDialog
+        open={canUpdateHermes && updateConfirmOpen}
+        onCancel={() => setUpdateConfirmOpen(false)}
+        onConfirm={() => void applyUpdate()}
+        title="Update Hermes?"
+        description={
+          updateInfo && updateInfo.behind && updateInfo.behind > 0
+            ? `This will run 'hermes update' (${updateInfo.update_command}) and pull ${updateInfo.behind} new commit${updateInfo.behind === 1 ? "" : "s"}. The gateway restarts when the update finishes; the current session keeps its prompt cache until then.`
+            : `This will run 'hermes update' (${updateInfo?.update_command ?? "hermes update"}) and restart the gateway when it finishes.`
+        }
+        confirmLabel="Update now"
+      />
 
       <DeleteConfirmDialog
         open={memoryReset.isOpen}
@@ -325,6 +449,220 @@ export default function SystemPage() {
           onClose={() => setActiveAction(null)}
         />
       )}
+
+      {/* ── Host / system stats ───────────────────────────────────── */}
+      <section className="flex flex-col gap-3">
+        <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
+          <Server className="h-4 w-4" /> Host
+        </H2>
+        <Card>
+          <CardContent className="py-4">
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-y-3 gap-x-6 text-sm">
+              <div>
+                <div className="text-xs uppercase tracking-wider text-muted-foreground">OS</div>
+                <div>{stats?.os} {stats?.os_release}</div>
+              </div>
+              <div>
+                <div className="text-xs uppercase tracking-wider text-muted-foreground">Arch</div>
+                <div>{stats?.arch}</div>
+              </div>
+              <div>
+                <div className="text-xs uppercase tracking-wider text-muted-foreground">Host</div>
+                <div className="truncate">{stats?.hostname}</div>
+              </div>
+              <div>
+                <div className="text-xs uppercase tracking-wider text-muted-foreground">Python</div>
+                <div>{stats?.python_impl} {stats?.python_version}</div>
+              </div>
+              <div>
+                <div className="text-xs uppercase tracking-wider text-muted-foreground">Hermes</div>
+                <div className="flex items-center gap-2">
+                  <span>v{stats?.hermes_version}</span>
+                  {canUpdateHermes &&
+                    updateInfo &&
+                    (updateInfo.update_available ? (
+                      <Badge tone="warning">
+                        {updateInfo.behind && updateInfo.behind > 0
+                          ? `${updateInfo.behind} behind`
+                          : "update available"}
+                      </Badge>
+                    ) : updateInfo.behind === 0 ? (
+                      <Badge tone="success">latest</Badge>
+                    ) : null)}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs uppercase tracking-wider text-muted-foreground flex items-center gap-1">
+                  <Cpu className="h-3 w-3" /> CPU
+                </div>
+                <div>
+                  {stats?.cpu_count ?? "—"} cores
+                  {typeof stats?.cpu_percent === "number"
+                    ? ` · ${stats.cpu_percent.toFixed(0)}%`
+                    : ""}
+                </div>
+              </div>
+              {stats?.memory && (
+                <div>
+                  <div className="text-xs uppercase tracking-wider text-muted-foreground">Memory</div>
+                  <div>
+                    {formatBytes(stats.memory.used)} / {formatBytes(stats.memory.total)} ({stats.memory.percent}%)
+                  </div>
+                </div>
+              )}
+              {stats?.disk && (
+                <div>
+                  <div className="text-xs uppercase tracking-wider text-muted-foreground flex items-center gap-1">
+                    <HardDrive className="h-3 w-3" /> Disk
+                  </div>
+                  <div>
+                    {formatBytes(stats.disk.used)} / {formatBytes(stats.disk.total)} ({stats.disk.percent}%)
+                  </div>
+                </div>
+              )}
+              {typeof stats?.uptime_seconds === "number" && (
+                <div>
+                  <div className="text-xs uppercase tracking-wider text-muted-foreground">Uptime</div>
+                  <div>{formatDuration(stats.uptime_seconds)}</div>
+                </div>
+              )}
+              {stats?.load_avg && stats.load_avg.length >= 3 && (
+                <div>
+                  <div className="text-xs uppercase tracking-wider text-muted-foreground">Load avg</div>
+                  <div>{stats.load_avg.map((n) => n.toFixed(2)).join(" / ")}</div>
+                </div>
+              )}
+            </div>
+            {stats && !stats.psutil && (
+              <p className="mt-3 text-xs text-muted-foreground">
+                Install the <span className="font-mono">psutil</span> extra for
+                CPU / memory / disk metrics.
+              </p>
+            )}
+            {canUpdateHermes && (
+              <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-border pt-4">
+                <Button
+                  size="sm"
+                  ghost
+                  disabled={checkingUpdate}
+                  prefix={
+                    checkingUpdate ? (
+                      <Spinner className="h-3.5 w-3.5" />
+                    ) : (
+                      <RotateCw className="h-3.5 w-3.5" />
+                    )
+                  }
+                  onClick={() => void checkForUpdate(true)}
+                >
+                  Check for updates
+                </Button>
+                {updateInfo?.update_available && updateInfo.can_apply && (
+                  <Button
+                    size="sm"
+                    prefix={<Download className="h-3.5 w-3.5" />}
+                    onClick={() => setUpdateConfirmOpen(true)}
+                  >
+                    Update now
+                  </Button>
+                )}
+                {updateInfo &&
+                  !updateInfo.can_apply &&
+                  updateInfo.update_available && (
+                    <span className="text-xs text-muted-foreground">
+                      Update with{" "}
+                      <span className="font-mono">{updateInfo.update_command}</span>
+                    </span>
+                  )}
+                {updateInfo?.message && !updateInfo.update_available && (
+                  <span className="text-xs text-muted-foreground">
+                    {updateInfo.message}
+                  </span>
+                )}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </section>
+
+      {/* ── Portal ────────────────────────────────────────────────── */}
+      <section className="flex flex-col gap-3">
+        <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
+          <Globe className="h-4 w-4" /> Nous Portal
+        </H2>
+        <Card>
+          <CardContent className="flex flex-col gap-3 py-4">
+            <div className="flex items-center gap-3">
+              <Badge tone={portal?.logged_in ? "success" : "secondary"}>
+                {portal?.logged_in ? "logged in" : "not logged in"}
+              </Badge>
+              {portal?.provider && (
+                <span className="text-sm text-muted-foreground">
+                  inference provider: {portal.provider}
+                </span>
+              )}
+              <a
+                href={portal?.subscription_url || "https://portal.nousresearch.com/manage-subscription"}
+                target="_blank"
+                rel="noreferrer"
+                className="ml-auto text-xs text-primary underline"
+              >
+                Manage subscription
+              </a>
+            </div>
+            {portal?.features && portal.features.length > 0 && (
+              <div className="flex flex-col gap-1 border-t border-border pt-3">
+                <span className="text-xs uppercase tracking-wider text-muted-foreground">
+                  Tool Gateway routing
+                </span>
+                {portal.features.map((f) => (
+                  <div key={f.label} className="flex items-center justify-between text-sm">
+                    <span>{f.label}</span>
+                    <span className="text-muted-foreground">{f.state}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {!portal?.logged_in && (
+              <p className="text-xs text-muted-foreground">
+                Log in with <span className="font-mono">hermes portal</span>.
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      </section>
+
+      {/* ── Curator ───────────────────────────────────────────────── */}
+      <section className="flex flex-col gap-3">
+        <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
+          <Sparkles className="h-4 w-4" /> Skill curator
+        </H2>
+        <Card>
+          <CardContent className="flex items-center justify-between py-4">
+            <div className="flex items-center gap-3">
+              <Badge tone={curator?.paused ? "warning" : curator?.enabled ? "success" : "secondary"}>
+                {curator?.paused ? "paused" : curator?.enabled ? "active" : "disabled"}
+              </Badge>
+              <span className="text-sm text-muted-foreground">
+                {curator?.interval_hours ? `every ${curator.interval_hours}h` : ""}
+                {curator?.last_run_at ? ` · last run ${new Date(curator.last_run_at).toLocaleString()}` : " · never run"}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button size="sm" ghost onClick={toggleCuratorPaused}>
+                {curator?.paused ? "Resume" : "Pause"}
+              </Button>
+              <Button
+                size="sm"
+                ghost
+                prefix={<Play className="h-3.5 w-3.5" />}
+                onClick={() => runOp(api.runCurator, "Curator review")}
+              >
+                Run now
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      </section>
 
       {/* ── Gateway ───────────────────────────────────────────────── */}
       <section className="flex flex-col gap-3">

@@ -1,26 +1,45 @@
 import { useStore } from '@nanostores/react'
-import { useMemo } from 'react'
+import { useCallback, useMemo } from 'react'
 
 import type { CommandCenterSection } from '@/app/command-center'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
-import { Activity, AlertCircle, Clock, Command, Cpu, Hash, Loader2, Sparkles } from '@/lib/icons'
+import { GlyphSpinner } from '@/components/ui/glyph-spinner'
+import { useI18n } from '@/i18n'
+import {
+  Activity,
+  AlertCircle,
+  Clock,
+  Command,
+  Hash,
+  Loader2,
+  Sparkles,
+  Terminal,
+  Zap,
+  ZapFilled
+} from '@/lib/icons'
 import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { cn } from '@/lib/utils'
-import { $desktopActionTasks } from '@/store/activity'
-import { $previewServerRestartStatus } from '@/store/preview'
+import { setGlobalYolo, setSessionYolo } from '@/lib/yolo-session'
 import {
   $busy,
-  $currentModel,
-  $currentProvider,
+  $connection,
   $currentUsage,
   $sessionStartedAt,
   $turnStartedAt,
-  $workingSessionIds,
-  setModelPickerOpen
+  $yoloActive,
+  setYoloActive
 } from '@/store/session'
-import { $subagentsBySession, activeSubagentCount } from '@/store/subagents'
-import { $desktopVersion, $updateApply, $updateStatus, setUpdateOverlayOpen } from '@/store/updates'
+import { $subagentsBySession, activeSubagentCount, failedSubagentCount } from '@/store/subagents'
+import { $gatewayRestarting } from '@/store/system-actions'
+import {
+  $backendUpdateApply,
+  $backendUpdateStatus,
+  $desktopVersion,
+  $updateApply,
+  $updateStatus,
+  openUpdateOverlayFor
+} from '@/store/updates'
 import type { StatusResponse } from '@/types/hermes'
 
 import { CRON_ROUTE } from '../../routes'
@@ -54,14 +73,10 @@ export function useStatusbarItems({
   toggleCommandCenter
 }: StatusbarItemsOptions) {
   const busy = useStore($busy)
-  const currentModel = useStore($currentModel)
-  const currentProvider = useStore($currentProvider)
   const currentUsage = useStore($currentUsage)
-  const desktopActionTasks = useStore($desktopActionTasks)
-  const previewServerRestartStatus = useStore($previewServerRestartStatus)
+  const gatewayRestarting = useStore($gatewayRestarting)
   const sessionStartedAt = useStore($sessionStartedAt)
   const turnStartedAt = useStore($turnStartedAt)
-  const workingSessionIds = useStore($workingSessionIds)
   const subagentsBySession = useStore($subagentsBySession)
   const updateStatus = useStore($updateStatus)
   const updateApply = useStore($updateApply)
@@ -83,24 +98,17 @@ export function useStatusbarItems({
     [gatewayLogLines, gatewayState, inferenceStatus, openCommandCenterSection, statusSnapshot]
   )
 
-  const { bgFailed, bgRunning, subagentsRunning } = useMemo(() => {
-    const actions = Object.values(desktopActionTasks)
-    const running = actions.filter(t => t.status.running).length
-    const failed = actions.filter(t => !t.status.running && (t.status.exit_code ?? 0) !== 0).length
-    const previewRunning = previewServerRestartStatus === 'running' ? 1 : 0
-    const previewFailed = previewServerRestartStatus === 'error' ? 1 : 0
-
-    const subagentsRunning = Object.values(subagentsBySession).reduce(
-      (sum, items) => sum + activeSubagentCount(items),
-      0
-    )
+  // The indicator must speak the same scope as the Spawn-tree panel it opens:
+  // every session's subagents, never background system actions (gateway
+  // restarts, toolset installs) which surface in their own panels.
+  const { subagentsFailed, subagentsRunning } = useMemo(() => {
+    const lists = Object.values(subagentsBySession)
 
     return {
-      bgFailed: failed + previewFailed,
-      bgRunning: workingSessionIds.length + running + previewRunning,
-      subagentsRunning
+      subagentsFailed: lists.reduce((sum, items) => sum + failedSubagentCount(items), 0),
+      subagentsRunning: lists.reduce((sum, items) => sum + activeSubagentCount(items), 0)
     }
-  }, [desktopActionTasks, previewServerRestartStatus, subagentsBySession, workingSessionIds])
+  }, [subagentsBySession])
 
   const gatewayOpen = gatewayState === 'open'
   const gatewayConnecting = gatewayState === 'connecting'
@@ -179,9 +187,15 @@ export function useStatusbarItems({
         variant: 'action'
       },
       {
-        className: gatewayClassName,
-        detail: gatewayDetail,
-        icon: inferenceReady ? <Activity className="size-3" /> : <AlertCircle className="size-3" />,
+        className: gatewayRestarting ? undefined : gatewayClassName,
+        detail: gatewayRestarting ? copy.gatewayRestarting : gatewayDetail,
+        icon: gatewayRestarting ? (
+          <GlyphSpinner ariaLabel={copy.gatewayRestarting} className="size-3" />
+        ) : inferenceReady ? (
+          <Activity className="size-3" />
+        ) : (
+          <AlertCircle className="size-3" />
+        ),
         id: 'gateway-health',
         label: 'Gateway',
         menuClassName: 'w-72',
@@ -192,20 +206,18 @@ export function useStatusbarItems({
       {
         className: cn(
           agentsOpen && 'bg-accent/55 text-foreground',
-          bgFailed > 0 && 'text-destructive hover:text-destructive'
+          subagentsFailed > 0 && 'text-destructive hover:text-destructive'
         ),
         detail:
           subagentsRunning > 0
-            ? `${subagentsRunning} subagent${subagentsRunning === 1 ? '' : 's'}`
-            : bgFailed > 0
-              ? `${bgFailed} failed`
-              : bgRunning > 0
-                ? `${bgRunning} running`
-                : undefined,
+            ? copy.subagents(subagentsRunning)
+            : subagentsFailed > 0
+              ? copy.failed(subagentsFailed)
+              : undefined,
         icon:
-          bgFailed > 0 ? (
+          subagentsFailed > 0 ? (
             <AlertCircle className="size-3" />
-          ) : bgRunning > 0 || subagentsRunning > 0 ? (
+          ) : subagentsRunning > 0 ? (
             <Loader2 className="size-3 animate-spin" />
           ) : (
             <Sparkles className="size-3" />
@@ -227,15 +239,15 @@ export function useStatusbarItems({
     ],
     [
       agentsOpen,
-      bgFailed,
-      bgRunning,
       commandCenterOpen,
       gatewayMenuContent,
       gatewayClassName,
       gatewayDetail,
+      gatewayRestarting,
       inferenceReady,
       inferenceStatus?.reason,
       openAgents,
+      subagentsFailed,
       subagentsRunning,
       toggleCommandCenter
     ]
@@ -269,17 +281,44 @@ export function useStatusbarItems({
         variant: 'text'
       },
       {
-        detail: currentProvider || '',
-        icon: <Cpu className="size-3" />,
-        id: 'model-summary',
-        label: currentModel || 'No model selected',
-        onSelect: () => setModelPickerOpen(true),
-        title: currentProvider ? `Switch model · ${currentProvider}: ${currentModel || ''}` : 'Open model picker',
+        className: cn('px-1', yoloActive && 'bg-(--chrome-action-hover)'),
+        hidden: !showYoloToggle,
+        icon: yoloActive ? (
+          <ZapFilled className="size-3.5 shrink-0" />
+        ) : (
+          <Zap className="size-3.5 shrink-0 opacity-70" />
+        ),
+        id: 'yolo',
+        onSelect: modifiers => void toggleYolo(modifiers),
+        title: yoloActive ? copy.yoloOn : copy.yoloOff,
+        variant: 'action'
+      },
+      {
+        className: `w-7 justify-center px-0${terminalTakeover ? ' bg-accent/55 text-foreground' : ''}`,
+        hidden: !chatOpen,
+        icon: <Terminal className="size-3.5" />,
+        id: 'terminal',
+        onSelect: () => setTerminalTakeover(!$terminalTakeover.get()),
+        title: terminalTakeover ? copy.hideTerminal : copy.showTerminal,
         variant: 'action'
       },
       versionItem
     ],
-    [busy, contextBar, contextUsage, currentModel, currentProvider, sessionStartedAt, turnStartedAt, versionItem]
+    [
+      busy,
+      chatOpen,
+      contextBar,
+      contextUsage,
+      copy,
+      sessionStartedAt,
+      showYoloToggle,
+      terminalTakeover,
+      toggleYolo,
+      turnStartedAt,
+      clientVersionItem,
+      backendVersionItem,
+      yoloActive
+    ]
   )
 
   const leftStatusbarItems = useMemo(

@@ -3,14 +3,8 @@ import type { ComponentProps, ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { Codicon } from '@/components/ui/codicon'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger
-} from '@/components/ui/dropdown-menu'
+import { Tip } from '@/components/ui/tooltip'
+import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { Volume2, VolumeX } from '@/lib/icons'
 import { cn } from '@/lib/utils'
@@ -223,38 +217,43 @@ function TitlebarToolButton({ navigate, tool }: { navigate: ReturnType<typeof us
 
   if (tool.href) {
     return (
-      <a
-        aria-label={tool.label}
-        className={className}
-        href={tool.href}
-        onPointerDown={event => event.stopPropagation()}
-        rel="noreferrer"
-        target="_blank"
-        title={tool.title ?? tool.label}
-      >
-        {tool.icon}
-      </a>
+      <Tip label={tool.title ?? tool.label}>
+        <Button asChild className={className} size="icon-titlebar" variant="ghost">
+          <a
+            aria-label={tool.label}
+            href={tool.href}
+            onPointerDown={event => event.stopPropagation()}
+            rel="noreferrer"
+            target="_blank"
+          >
+            {tool.icon}
+          </a>
+        </Button>
+      </Tip>
     )
   }
 
   return (
-    <button
-      aria-label={tool.label}
-      aria-pressed={tool.active ?? undefined}
-      className={className}
-      disabled={tool.disabled}
-      onClick={() => {
-        if (tool.to) {
-          navigate(tool.to)
-        }
+    <Tip label={tool.title ?? tool.label}>
+      <Button
+        aria-label={tool.label}
+        aria-pressed={tool.active ?? undefined}
+        className={className}
+        disabled={tool.disabled}
+        onClick={() => {
+          if (tool.to) {
+            navigate(tool.to)
+          }
 
-        tool.onSelect?.()
-      }}
-      onPointerDown={event => event.stopPropagation()}
-      title={tool.title ?? tool.label}
-      type="button"
-    >
-      {tool.icon}
-    </button>
+          tool.onSelect?.()
+        }}
+        onPointerDown={event => event.stopPropagation()}
+        size="icon-titlebar"
+        type="button"
+        variant="ghost"
+      >
+        {tool.icon}
+      </Button>
+    </Tip>
   )
 }

@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 
 import { getHermesConfigDefaults, getHermesConfigRecord, saveHermesConfig } from '@/hermes'
 import { triggerHaptic } from '@/lib/haptics'
-import { Archive, Globe, Info, KeyRound, Package, Wrench } from '@/lib/icons'
+import { Archive, Bell, Globe, Info, KeyRound, Settings2, Sparkles, Wrench, Zap } from '@/lib/icons'
 import { notifyError } from '@/store/notifications'
 
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
@@ -19,6 +19,8 @@ import { SEARCH_PLACEHOLDER, SECTIONS } from './constants'
 import { GatewaySettings } from './gateway-settings'
 import { KeysSettings } from './keys-settings'
 import { McpSettings } from './mcp-settings'
+import { NotificationsSettings } from './notifications-settings'
+import { PROVIDER_VIEWS, ProvidersSettings, type ProviderView } from './providers-settings'
 import { SessionsSettings } from './sessions-settings'
 import { ToolsSettings } from './tools-settings'
 import type { SettingsPageProps, SettingsQueryKey, SettingsView as SettingsViewId } from './types'
@@ -28,6 +30,7 @@ const SETTINGS_VIEWS: readonly SettingsViewId[] = [
   'gateway',
   'keys',
   'mcp',
+  'notifications',
   'sessions',
   'tools',
   'about'
@@ -127,6 +130,12 @@ export function SettingsView({ gateway, onClose, onConfigSaved }: SettingsPagePr
               />
             )
           })}
+          <OverlayNavItem
+            active={activeView === 'notifications'}
+            icon={Bell}
+            label={t.settings.nav.notifications}
+            onClick={() => setActiveView('notifications')}
+          />
           <div className="my-2 h-px bg-border/30" />
           <OverlayNavItem
             active={activeView === 'gateway'}
@@ -205,12 +214,14 @@ export function SettingsView({ gateway, onClose, onConfigSaved }: SettingsPagePr
               onConfigSaved={onConfigSaved}
               query={queries.config}
             />
+          ) : activeView === 'providers' ? (
+            <ProvidersSettings onClose={onClose} onViewChange={setProviderView} view={providerView} />
           ) : activeView === 'keys' ? (
             <KeysSettings query={queries.keys} />
           ) : activeView === 'mcp' ? (
-            <McpSettings gateway={gateway} onConfigSaved={onConfigSaved} query={queries.mcp} />
-          ) : activeView === 'sessions' ? (
-            <SessionsSettings query={queries.sessions} />
+            <McpSettings gateway={gateway} onConfigSaved={onConfigSaved} />
+          ) : activeView === 'notifications' ? (
+            <NotificationsSettings />
           ) : (
             <ToolsSettings query={queries.tools} />
           )}

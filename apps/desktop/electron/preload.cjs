@@ -1,7 +1,38 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron')
 
 contextBridge.exposeInMainWorld('hermesDesktop', {
-  getConnection: () => ipcRenderer.invoke('hermes:connection'),
+  getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
+  revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
+  touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
+  getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
+  openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
+  openNewSessionWindow: () => ipcRenderer.invoke('hermes:window:openNewSession'),
+  petOverlay: {
+    // Main renderer → main process: window lifecycle + drag. `request` is
+    // `{ bounds, screen }`; resolves with the screen bounds it actually used.
+    open: request => ipcRenderer.invoke('hermes:pet-overlay:open', request),
+    close: () => ipcRenderer.invoke('hermes:pet-overlay:close'),
+    setBounds: bounds => ipcRenderer.send('hermes:pet-overlay:set-bounds', bounds),
+    setIgnoreMouse: ignore => ipcRenderer.send('hermes:pet-overlay:ignore-mouse', ignore),
+    // Flip the overlay focusable (and focus it) while the composer needs keys.
+    setFocusable: focusable => ipcRenderer.send('hermes:pet-overlay:set-focusable', focusable),
+    // Main renderer → overlay (forwarded by main): push the latest pet state.
+    pushState: payload => ipcRenderer.send('hermes:pet-overlay:state', payload),
+    // Overlay → main renderer (forwarded by main): pop back in / composer submit.
+    control: payload => ipcRenderer.send('hermes:pet-overlay:control', payload),
+    // Overlay subscribes to state pushes.
+    onState: callback => {
+      const listener = (_event, payload) => callback(payload)
+      ipcRenderer.on('hermes:pet-overlay:state', listener)
+      return () => ipcRenderer.removeListener('hermes:pet-overlay:state', listener)
+    },
+    // Main renderer subscribes to overlay control messages.
+    onControl: callback => {
+      const listener = (_event, payload) => callback(payload)
+      ipcRenderer.on('hermes:pet-overlay:control', listener)
+      return () => ipcRenderer.removeListener('hermes:pet-overlay:control', listener)
+    }
+  },
   getBootProgress: () => ipcRenderer.invoke('hermes:boot-progress:get'),
   getConnectionConfig: () => ipcRenderer.invoke('hermes:connection-config:get'),
   saveConnectionConfig: payload => ipcRenderer.invoke('hermes:connection-config:save', payload),
@@ -30,6 +61,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   setTitleBarTheme: payload => ipcRenderer.send('hermes:titlebar-theme', payload),
   setPreviewShortcutActive: active => ipcRenderer.send('hermes:previewShortcutActive', Boolean(active)),
   openExternal: url => ipcRenderer.invoke('hermes:openExternal', url),
+  openPreviewInBrowser: url => ipcRenderer.invoke('hermes:openPreviewInBrowser', url),
   fetchLinkTitle: url => ipcRenderer.invoke('hermes:fetchLinkTitle', url),
   revealLogs: () => ipcRenderer.invoke('hermes:logs:reveal'),
   getRecentLogs: () => ipcRenderer.invoke('hermes:logs:recent'),
@@ -68,6 +100,16 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     ipcRenderer.on('hermes:window-state-changed', listener)
     return () => ipcRenderer.removeListener('hermes:window-state-changed', listener)
   },
+  onFocusSession: callback => {
+    const listener = (_event, sessionId) => callback(sessionId)
+    ipcRenderer.on('hermes:focus-session', listener)
+    return () => ipcRenderer.removeListener('hermes:focus-session', listener)
+  },
+  onNotificationAction: callback => {
+    const listener = (_event, payload) => callback(payload)
+    ipcRenderer.on('hermes:notification-action', listener)
+    return () => ipcRenderer.removeListener('hermes:notification-action', listener)
+  },
   onPreviewFileChanged: callback => {
     const listener = (_event, payload) => callback(payload)
     ipcRenderer.on('hermes:preview-file-changed', listener)
@@ -97,6 +139,11 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     return () => ipcRenderer.removeListener('hermes:bootstrap:event', listener)
   },
   getVersion: () => ipcRenderer.invoke('hermes:version'),
+  getRemoteDisplayReason: () => ipcRenderer.invoke('hermes:get-remote-display-reason'),
+  uninstall: {
+    summary: () => ipcRenderer.invoke('hermes:uninstall:summary'),
+    run: mode => ipcRenderer.invoke('hermes:uninstall:run', { mode })
+  },
   updates: {
     check: () => ipcRenderer.invoke('hermes:updates:check'),
     apply: opts => ipcRenderer.invoke('hermes:updates:apply', opts),

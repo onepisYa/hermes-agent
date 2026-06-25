@@ -142,6 +142,7 @@ export const ga: Translations = {
     sessionDeleted: "Seisiún scriosta",
     failedToDelete: "Theip ar scriosadh an tseisiúin",
     resumeInChat: "Lean ar aghaidh sa chomhrá",
+    newChat: "Comhrá nua",
     previousPage: "Leathanach roimhe seo",
     nextPage: "An chéad leathanach eile",
     roles: {
@@ -235,8 +236,8 @@ export const ga: Translations = {
     nameRequired: "Tá ainm riachtanach",
     nameRule:
       "Litreacha cás íochtair, digití, _ agus - amháin; caithfidh tús a chur le litir nó digit; suas le 64 carachtar.",
-    invalidName: "Ainm próifíle neamhbhailí",
-    cloneFromDefault: "Clónáil cumraíocht ón bpróifíl réamhshocraithe",
+    invalidName: "Ainm próifíle neamhbhailí",    cloneFrom: "Clónáil cumraíocht ón bpróifíl",
+    cloneFromNone: "Dada (folamh)",
     allProfiles: "Próifílí",
     noProfiles: "Níor aimsíodh próifílí.",
     defaultBadge: "réamhshocraithe",

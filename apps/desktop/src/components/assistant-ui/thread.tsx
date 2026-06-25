@@ -48,18 +48,16 @@ import { detectTrigger, textBeforeCaret, type TriggerState } from '@/app/chat/co
 import { ComposerTriggerPopover } from '@/app/chat/composer/trigger-popover'
 import { extractDroppedFiles, HERMES_PATHS_MIME } from '@/app/chat/hooks/use-composer-actions'
 import { ClarifyTool } from '@/components/assistant-ui/clarify-tool'
-import { DirectiveContent, DirectiveText } from '@/components/assistant-ui/directive-text'
-import { hermesDirectiveFormatter } from '@/components/assistant-ui/directive-text'
-import { MarkdownText } from '@/components/assistant-ui/markdown-text'
-import { VirtualizedThread } from '@/components/assistant-ui/thread-virtualizer'
-import { HoistedTodoPanel, todosFromMessageContent } from '@/components/assistant-ui/todo-tool'
+import { DirectiveContent, hermesDirectiveFormatter } from '@/components/assistant-ui/directive-text'
+import { MarkdownText, MarkdownTextContent } from '@/components/assistant-ui/markdown-text'
+import { ThreadMessageList } from '@/components/assistant-ui/thread-list'
+import { ThreadTimeline } from '@/components/assistant-ui/thread-timeline'
 import { ToolFallback, ToolGroupSlot } from '@/components/assistant-ui/tool-fallback'
 import { TooltipIconButton } from '@/components/assistant-ui/tooltip-icon-button'
 import { useElapsedSeconds } from '@/components/chat/activity-timer'
 import { ActivityTimerText } from '@/components/chat/activity-timer-text'
 import { DisclosureRow } from '@/components/chat/disclosure-row'
-import { GeneratedImageProvider, useGeneratedImageContext } from '@/components/chat/generated-image-context'
-import { ImageGenerationPlaceholder } from '@/components/chat/image-generation-placeholder'
+import { GeneratedImage } from '@/components/chat/generated-image-result'
 import { Intro, type IntroProps } from '@/components/chat/intro'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { Codicon } from '@/components/ui/codicon'
@@ -75,12 +73,16 @@ import { Loader } from '@/components/ui/loader'
 import type { HermesGateway } from '@/hermes'
 import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
 import { triggerHaptic } from '@/lib/haptics'
-import { GitBranchIcon, Loader2Icon, Volume2Icon, VolumeXIcon } from '@/lib/icons'
+import { GitBranchIcon, Loader2Icon, Volume2Icon, VolumeXIcon, XIcon } from '@/lib/icons'
 import { extractPreviewTargets } from '@/lib/preview-targets'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { playSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
+import { $compactionActive } from '@/store/compaction'
+import type { ComposerAttachment } from '@/store/composer'
 import { notifyError } from '@/store/notifications'
+import { $connection } from '@/store/session'
+import { notifyThreadEditClose, notifyThreadEditOpen } from '@/store/thread-scroll'
 import { $voicePlayback } from '@/store/voice-playback'
 
 type ThreadLoadingState = 'response' | 'session'
@@ -127,6 +129,8 @@ export const Thread: FC<{
   loading?: ThreadLoadingState
   onBranchInNewChat?: (messageId: string) => void
   onCancel?: () => Promise<void> | void
+  onDismissError?: (messageId: string) => void
+  onRestoreToMessage?: (messageId: string) => Promise<void> | void
   sessionId?: string | null
   sessionKey?: string | null
 }> = ({
@@ -137,17 +141,19 @@ export const Thread: FC<{
   loading,
   onBranchInNewChat,
   onCancel,
+  onDismissError,
+  onRestoreToMessage,
   sessionId = null,
   sessionKey
 }) => {
   const messageComponents = useMemo(
     () => ({
-      AssistantMessage: () => <AssistantMessage onBranchInNewChat={onBranchInNewChat} />,
+      AssistantMessage: () => <AssistantMessage onBranchInNewChat={onBranchInNewChat} onDismissError={onDismissError} />,
       SystemMessage,
       UserEditComposer: () => <UserEditComposer cwd={cwd} gateway={gateway} sessionId={sessionId} />,
       UserMessage: () => <UserMessage onCancel={onCancel} />
     }),
-    [cwd, gateway, onBranchInNewChat, onCancel, sessionId]
+    [cwd, gateway, onBranchInNewChat, onCancel, onDismissError, onRestoreToMessage, sessionId]
   )
 
   const emptyPlaceholder = intro ? (
@@ -160,18 +166,17 @@ export const Thread: FC<{
   ) : undefined
 
   return (
-    <GeneratedImageProvider>
-      <div className="relative grid h-full min-h-0 max-w-full grid-rows-[minmax(0,1fr)] overflow-hidden bg-transparent contain-[layout_paint]">
-        <VirtualizedThread
-          clampToComposer={clampToComposer}
-          components={messageComponents}
-          emptyPlaceholder={emptyPlaceholder}
-          loadingIndicator={loading === 'response' ? <ResponseLoadingIndicator /> : null}
-          sessionKey={sessionKey}
-        />
-        {loading === 'session' && <CenteredThreadSpinner />}
-      </div>
-    </GeneratedImageProvider>
+    <div className="relative grid h-full min-h-0 max-w-full grid-rows-[minmax(0,1fr)] overflow-hidden bg-transparent contain-[layout_paint]">
+      <ThreadMessageList
+        clampToComposer={clampToComposer}
+        components={messageComponents}
+        emptyPlaceholder={emptyPlaceholder}
+        loadingIndicator={loading === 'response' ? <ResponseLoadingIndicator /> : null}
+        sessionKey={sessionKey}
+      />
+      {loading === 'session' && <CenteredThreadSpinner />}
+      <ThreadTimeline />
+    </div>
   )
 }
 
@@ -202,11 +207,30 @@ const CenteredThreadSpinner: FC = () => (
   </div>
 )
 
-const AssistantMessage: FC<{ onBranchInNewChat?: (messageId: string) => void }> = ({ onBranchInNewChat }) => {
+const AssistantMessage: FC<{
+  onBranchInNewChat?: (messageId: string) => void
+  onDismissError?: (messageId: string) => void
+}> = ({ onBranchInNewChat, onDismissError }) => {
   const messageId = useAuiState(s => s.message.id)
-  const content = useAuiState(s => s.message.content)
-  const messageText = messageContentText(content)
-  const hoistedTodos = useMemo(() => todosFromMessageContent(content), [content])
+  const messageRuntime = useMessageRuntime()
+  const { t } = useI18n()
+
+  // PERF: this component must NOT subscribe to the streaming text. Every
+  // selector here returns a value that stays referentially stable across
+  // token flushes (booleans, status strings, '' while running), so the
+  // 30 Hz delta stream only re-renders the markdown part and the tiny
+  // StreamStallIndicator leaf — not the footer/preview/root subtree.
+  const messageStatus = useAuiState(s => s.message.status?.type)
+  const isRunning = messageStatus === 'running'
+  const isPlaceholder = useAuiState(s => s.message.status?.type === 'running' && s.message.content.length === 0)
+  const hasVisibleText = useAuiState(s => contentHasVisibleText(s.message.content))
+
+  // Preview targets only materialize once the turn completes — while running
+  // the selector returns '' (stable), so per-token flushes skip the regex
+  // scan and the re-render it would cause.
+  const completedText = useAuiState(s =>
+    s.message.status?.type === 'running' ? '' : messageContentText(s.message.content)
+  )
 
   const previewTargets = useMemo(() => {
     if (!messageText || !/(https?:\/\/|file:\/\/)/i.test(messageText)) {
@@ -216,9 +240,9 @@ const AssistantMessage: FC<{ onBranchInNewChat?: (messageId: string) => void }> 
     return pickPrimaryPreviewTarget(extractPreviewTargets(messageText))
   }, [messageText])
 
-  const messageStatus = useAuiState(s => s.message.status?.type)
-  const isPlaceholder = messageStatus === 'running' && content.length === 0
-  const interruptedOnly = useMemo(() => isInterruptedOnlyMessage(messageText), [messageText])
+  const getMessageText = useCallback(() => messageContentText(messageRuntime.getState().content), [messageRuntime])
+
+  const enterRef = useEnterAnimation(isRunning, `assistant-message:${messageId}`)
 
   if (isPlaceholder) {
     return null
@@ -248,10 +272,20 @@ const AssistantMessage: FC<{ onBranchInNewChat?: (messageId: string) => void }> 
         )}
         <MessagePrimitive.Error>
           <ErrorPrimitive.Root
-            className="mt-1.5 text-[0.78rem] leading-5 text-[color-mix(in_srgb,var(--dt-destructive)_78%,var(--ui-text-secondary))]"
+            className="mt-1.5 flex items-start gap-1.5 text-[0.78rem] leading-5 text-[color-mix(in_srgb,var(--dt-destructive)_78%,var(--ui-text-secondary))]"
             role="alert"
           >
-            <ErrorPrimitive.Message />
+            <ErrorPrimitive.Message className="min-w-0 flex-1" />
+            {onDismissError && (
+              <TooltipIconButton
+                className="-my-0.5 shrink-0 text-current opacity-70 hover:opacity-100"
+                onClick={() => onDismissError(messageId)}
+                side="top"
+                tooltip={t.assistant.thread.dismissError}
+              >
+                <XIcon className="size-3.5" />
+              </TooltipIconButton>
+            )}
           </ErrorPrimitive.Root>
         </MessagePrimitive.Error>
       </div>
@@ -279,32 +313,93 @@ const StatusRow: FC<{ children: ReactNode; label: string } & React.ComponentProp
   </div>
 )
 
+// Fixed label while auto-compaction runs — decoupled from backend status text.
+const COMPACTION_LABEL = 'Summarizing thread'
+
+const CompactionHint: FC = () => (
+  <span className="shimmer min-w-0 truncate text-muted-foreground/55">{COMPACTION_LABEL}</span>
+)
+
 const ResponseLoadingIndicator: FC = () => {
   const elapsed = useElapsedSeconds()
+  const compacting = useStore($compactionActive)
 
   return (
-    <StatusRow data-slot="aui_response-loading" label="Hermes is loading a response">
+    <StatusRow
+      data-slot="aui_response-loading"
+      label={compacting ? COMPACTION_LABEL : t.assistant.thread.loadingResponse}
+    >
       <span aria-hidden="true" className="dither inline-block size-3 rounded-[2px] text-midground/80 animate-pulse" />
+      {compacting && <CompactionHint />}
       <ActivityTimerText seconds={elapsed} />
     </StatusRow>
   )
 }
 
-const ImageGenerateTool: FC<ToolCallMessagePartProps> = ({ result }) => {
-  const generatedImage = useGeneratedImageContext()
-  const running = result === undefined
+// Seconds of no visible output (text or part count) before a still-running turn
+// is treated as stalled and the thinking indicator returns at the tail.
+const STREAM_STALL_S = 2
+
+// Tail "still thinking" indicator: the pre-first-token spinner goes away once
+// text flows, but if the stream then goes quiet mid-turn (tool think-time,
+// provider stall) nothing signals that work continues. Watch a per-flush
+// activity signal; when it hasn't changed for STREAM_STALL_S, re-show the
+// dither + a timer counting from the last activity.
+//
+// Subscribes to the activity signal ITSELF (rather than taking it as a prop)
+// so that per-token updates re-render only this leaf, not the whole
+// AssistantMessage subtree.
+const StreamStallIndicator: FC = () => {
+  const activity = useAuiState(s => {
+    let textLength = 0
+
+    for (const part of s.message.content) {
+      const text = (part as { text?: unknown }).text
+
+      if (typeof text === 'string') {
+        textLength += text.length
+      }
+    }
+
+    return `${s.message.content.length}:${textLength}`
+  })
+
+  const [stalled, setStalled] = useState(false)
+  const compacting = useStore($compactionActive)
 
   useEffect(() => {
-    generatedImage?.setPending(running)
-  }, [generatedImage, running])
+    setStalled(false)
+    const id = window.setTimeout(() => setStalled(true), STREAM_STALL_S * 1000)
 
-  if (!running) {
+    return () => window.clearTimeout(id)
+  }, [activity])
+
+  const active = stalled || compacting
+  const elapsed = useElapsedSeconds(active)
+
+  if (!active) {
     return null
   }
 
   return (
+    <StatusRow
+      className="mt-1.5"
+      data-slot="aui_stream-stall"
+      label={compacting ? COMPACTION_LABEL : 'Hermes is thinking'}
+    >
+      <span aria-hidden="true" className="dither inline-block size-3 rounded-[2px] text-midground/80 animate-pulse" />
+      {compacting && <CompactionHint />}
+      <ActivityTimerText seconds={elapsed} />
+    </StatusRow>
+  )
+}
+
+const ImageGenerateTool: FC<ToolCallMessagePartProps> = ({ args, result }) => {
+  const aspectRatio = typeof args?.aspect_ratio === 'string' ? args.aspect_ratio : undefined
+
+  return (
     <div className="mt-1.5">
-      <ImageGenerationPlaceholder />
+      <GeneratedImage aspectRatio={aspectRatio} result={result} />
     </div>
   )
 }
@@ -446,15 +541,12 @@ const ReasoningTextPart: FC<{ text: string; status?: { type: string } }> = ({ te
   const displayText = text.trimStart()
 
   return (
-    <div
-      className={cn(
-        'whitespace-pre-wrap text-xs leading-relaxed text-muted-foreground/85',
-        status?.type === 'running' && 'shimmer text-muted-foreground/55'
-      )}
-      data-slot="aui_reasoning-text"
-    >
-      {displayText}
-    </div>
+    <MarkdownTextContent
+      containerClassName="text-xs leading-snug text-muted-foreground/85"
+      containerProps={{ 'data-slot': 'aui_reasoning-text' } as ComponentProps<'div'>}
+      isRunning={isRunning}
+      text={displayText}
+    />
   )
 }
 
@@ -633,14 +725,85 @@ function messageAttachmentRefs(value: unknown): string[] {
   return value.every(ref => typeof ref === 'string') ? value : EMPTY_ATTACHMENT_REFS
 }
 
-function StickyHumanMessageContainer({ children }: { children: ReactNode }) {
+function StickyHumanMessageContainer({
+  attachments,
+  children,
+  messageId
+}: {
+  attachments?: ReactNode
+  children: ReactNode
+  messageId?: string
+}) {
   return (
-    <div
-      className="group/user-message sticky top-0 z-40 -mx-4 flex w-[calc(100%+2rem)] min-w-0 max-w-none flex-col items-stretch gap-0 self-end overflow-visible bg-(--ui-chat-surface-background) px-4 pb-(--conversation-turn-gap) pt-2"
-      data-role="user"
-      data-slot="aui_user-message-root"
-    >
-      {children}
+    // Fragment, not a wrapper: a wrapping element becomes the sticky's
+    // containing block (it'd stick within its own height = never). The bubble
+    // and attachments are flow siblings so the bubble pins against the scroller
+    // while attachments below it scroll away.
+    <>
+      <div
+        className="group/user-message sticky z-40 -mx-4 flex w-[calc(100%+2rem)] min-w-0 max-w-none flex-col items-stretch gap-0 self-end overflow-visible bg-(--ui-chat-surface-background) px-4 pb-(--conversation-turn-gap) pt-1"
+        data-message-id={messageId}
+        data-role="user"
+        data-slot="aui_user-message-root"
+      >
+        {children}
+      </div>
+      {attachments}
+    </>
+  )
+}
+
+// Shared "user bubble" base. Both the read-only message and the inline
+// edit composer render the same bubble surface (rounded glass card);
+// they only differ in border weight, cursor, and padding-right (the
+// read-only view reserves room for the restore icon).
+//
+// no-drag: sticky bubbles park at --sticky-human-top (~4px), sliding under the
+// titlebar's [-webkit-app-region:drag] strips (app-shell.tsx). Electron resolves
+// drag regions at the compositor level — z-index and pointer-events don't help —
+// so without the carve-out, clicking a stuck bubble drags the window instead of
+// opening the edit composer.
+const USER_BUBBLE_BASE_CLASS =
+  'composer-human-message standalone-glass relative flex w-full min-w-0 max-w-full flex-col gap-1.5 overflow-y-auto rounded-xl border bg-(--dt-user-bubble) px-3 py-2 text-left [-webkit-app-region:no-drag]'
+
+const USER_ACTION_ICON_BUTTON_CLASS =
+  'grid place-items-center rounded-md bg-transparent text-(--ui-text-secondary) transition-colors hover:bg-(--ui-control-active-background) hover:text-foreground disabled:cursor-default disabled:text-(--ui-text-quaternary) disabled:opacity-70'
+
+const USER_ACTION_ICON_SIZE = '0.6875rem'
+const StopGlyph = <IconPlayerStopFilled aria-hidden className="size-3.5 -translate-y-px" />
+
+// Background-process notifications are injected into the conversation as user
+// messages (the agent must react to them, and message-role alternation forbids
+// a synthetic system row mid-loop). They are NOT something the human typed, so
+// render them as a compact system-style notice instead of a user bubble.
+// Shape: see tools/process_registry.py format_process_notification().
+const PROCESS_NOTIFICATION_RE = /^\[IMPORTANT: Background process [\s\S]*\]$/
+
+const ProcessNotificationNote: FC<{ text: string }> = ({ text }) => {
+  const body = text.replace(/^\[IMPORTANT:\s*/, '').replace(/\]$/, '')
+  const newline = body.indexOf('\n')
+  const headline = (newline === -1 ? body : body.slice(0, newline)).trim()
+  const detail = newline === -1 ? '' : body.slice(newline + 1).trim()
+
+  return (
+    <div className="flex max-w-[min(86%,44rem)] flex-col gap-0.5 self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/60">
+      <span className="flex items-center gap-1.5">
+        <Codicon className="shrink-0 text-muted-foreground/55" name="terminal" size="0.75rem" />
+        <span className="wrap-anywhere">{headline}</span>
+      </span>
+      {detail && (
+        <details className="pl-[1.3125rem]">
+          <summary className="cursor-pointer select-none text-muted-foreground/45 hover:text-muted-foreground/70">
+            output
+          </summary>
+          <pre
+            className="mt-0.5 max-h-48 overflow-auto whitespace-pre-wrap font-mono text-[0.625rem] leading-4 text-muted-foreground/55"
+            data-selectable-text="true"
+          >
+            {detail}
+          </pre>
+        </details>
+      )}
     </div>
   )
 }
@@ -695,42 +858,52 @@ const UserMessage: FC<{
     !threadRunning && 'cursor-pointer hover:border-(--ui-stroke-secondary)'
   )
 
-  const bubbleContent = (
-    <>
-      {attachmentRefs.length > 0 && (
-        <span className="-mx-1 flex flex-wrap gap-1 border-b border-border/45 pb-1.5">
-          <DirectiveContent text={attachmentRefs.join(' ')} />
-        </span>
-      )}
-      {hasBody && (
-        <span className="wrap-anywhere block whitespace-pre-line">
-          <MessagePrimitive.Parts components={{ Text: DirectiveText }} />
-        </span>
-      )}
-    </>
+  const bubbleContent = hasBody && (
+    // Render the user's text through a minimal markdown pipeline:
+    // backtick `code` and ``` fenced ``` blocks, with directive chips
+    // (`@file:` etc.) still resolved inside the plain-text spans.
+    <div className="sticky-human-clamp" data-clamped={bodyClamped ? 'true' : undefined}>
+      {/* Match the edit composer's collapsed line box (min-h-[1.25rem]) so
+          clicking to edit can't grow the bubble by a sub-pixel and reflow the
+          turn 1px. */}
+      <div className="min-h-[1.25rem]" ref={clampInnerRef}>
+        <UserMessageText className="wrap-anywhere" text={messageText} />
+      </div>
+    </div>
   )
 
   return (
     <MessagePrimitive.Root asChild>
-      <StickyHumanMessageContainer>
+      <StickyHumanMessageContainer
+        messageId={messageId}
+        attachments={
+          // Attachments live BELOW the sticky bubble in normal flow, so they
+          // scroll away behind the pinned bubble instead of riding along with
+          // it. Image refs render as thumbnails, file refs as chips; no border.
+          attachmentRefs.length > 0 ? (
+            <div className="flex flex-wrap gap-1 -mt-3 mb-2">
+              <DirectiveContent text={attachmentRefs.join(' ')} />
+            </div>
+          ) : null
+        }
+      >
         <ActionBarPrimitive.Root className="relative w-full max-w-full" data-slot="aui_user-bubble-actions">
           <div className="human-message-with-todos-wrapper flex w-full flex-col gap-0">
             <div className="relative w-full">
-              {threadRunning ? (
-                <div className={bubbleClassName}>{bubbleContent}</div>
-              ) : (
-                <ActionBarPrimitive.Edit asChild>
-                  <button
-                    aria-label="Edit message"
-                    className={bubbleClassName}
-                    onClick={() => triggerHaptic('selection')}
-                    title="Edit message"
-                    type="button"
-                  >
-                    {bubbleContent}
-                  </button>
-                </ActionBarPrimitive.Edit>
-              )}
+              {/* Always editable — clicking opens the edit composer even while a
+                  turn streams; sending the edit reverts (interrupt + rewind). */}
+              <ActionBarPrimitive.Edit asChild>
+                <button
+                  aria-label={copy.editMessage}
+                  className={bubbleClassName}
+                  onClick={() => triggerHaptic('selection')}
+                  onPointerDown={() => notifyThreadEditOpen()}
+                  title={copy.editMessage}
+                  type="button"
+                >
+                  {bubbleContent}
+                </button>
+              </ActionBarPrimitive.Edit>
               {(showStop || showRestore) && (
                 <div className="pointer-events-none absolute right-2 bottom-2 z-10 flex items-center justify-center opacity-0 transition-opacity group-hover/user-message:opacity-100 group-focus-within/user-message:opacity-100">
                   {showStop ? (
@@ -847,6 +1020,8 @@ const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sessionId }
   const canSubmit = draft.trim().length > 0
   const at = useAtCompletions({ cwd, gateway, sessionId })
   const slash = useSlashCompletions({ gateway })
+
+  useEffect(() => () => notifyThreadEditClose(), [])
 
   const focusEditor = useCallback(() => {
     const editor = editorRef.current
@@ -1275,10 +1450,11 @@ const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sessionId }
             data-expanded={expanded ? 'true' : undefined}
           >
             <div
-              aria-label="Edit message"
-              autoFocus
+              aria-label={copy.editMessage}
+              autoCapitalize="off"
+              autoCorrect="off"
               className={cn(
-                'ui-prompt-input-editor__input max-h-48 w-full resize-none bg-transparent p-0 pr-7 text-[length:var(--conversation-text-font-size)] leading-(--dt-line-height) text-foreground/95 outline-none',
+                'ui-prompt-input-editor__input max-h-48 w-full resize-none bg-transparent p-0 pr-7 text-[length:var(--conversation-text-font-size)] text-foreground/95 outline-none',
                 'empty:before:content-[attr(data-placeholder)] empty:before:text-muted-foreground/60',
                 '**:data-ref-text:cursor-default',
                 expanded ? 'min-h-16' : 'min-h-[1.25rem]'

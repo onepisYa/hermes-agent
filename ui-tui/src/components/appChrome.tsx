@@ -229,6 +229,7 @@ export interface StatusBarSegments {
   compressions: boolean
   cost: boolean
   duration: boolean
+  subagents: boolean
   voice: boolean
 }
 
@@ -242,6 +243,7 @@ export function statusBarSegments(cols: number): StatusBarSegments {
     compressions: w >= 80,
     voice: w >= 84,
     bg: w >= 88,
+    subagents: w >= 92,
     cost: w >= 96
   }
 }
@@ -443,6 +445,8 @@ export function StatusRule({
   const showVoice = segs.voice && !!voiceLabel && fits(SEP + stringWidth(voiceLabel))
   const showSessionCount = !!sessionCountText && fits(SEP + stringWidth(sessionCountText))
   const showBg = segs.bg && bgCount > 0 && fits(SEP + stringWidth(`${bgCount} bg`))
+  const subagentCount = typeof usage.active_subagents === 'number' ? usage.active_subagents : 0
+  const showSubagents = segs.subagents && subagentCount > 0 && fits(SEP + stringWidth(`⛓ ${subagentCount}`))
   const showCostSeg = segs.cost && showCost && !!costText && fits(SEP + stringWidth(costText))
 
   const handleSessionCountClick = (event: { stopImmediatePropagation?: () => void }) => {
@@ -518,6 +522,12 @@ export function StatusRule({
           <Text color={t.color.muted} wrap="truncate-end">
             {' │ '}
             {bgCount} bg
+          </Text>
+        ) : null}
+        {showSubagents ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {' │ '}
+            ⛓ {subagentCount}
           </Text>
         ) : null}
         {showCostSeg ? (

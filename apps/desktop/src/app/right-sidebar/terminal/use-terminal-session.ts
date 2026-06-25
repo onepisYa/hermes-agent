@@ -8,7 +8,16 @@ import type { CSSProperties } from 'react'
 
 import { triggerHaptic } from '@/lib/haptics'
 
-import { isAddSelectionShortcut, terminalSelectionAnchor, terminalSelectionLabel, terminalTheme } from './selection'
+import { $terminalInjection } from '../store'
+
+import { makeTerminalReader, setActiveTerminalReader } from './buffer'
+import {
+  isAddSelectionShortcut,
+  resolveSurfaceColor,
+  terminalSelectionAnchor,
+  terminalSelectionLabel,
+  terminalTheme
+} from './selection'
 
 type TerminalStatus = 'closed' | 'open' | 'starting'
 
@@ -436,6 +445,49 @@ export function useTerminalSession({ cwd, onAddSelectionToChat }: UseTerminalSes
       selectionLabelRef.current = ''
     }
   }, [addSelectionToChat, cwd])
+
+  useEffect(() => {
+    const term = termRef.current
+
+    if (!term) {
+      return
+    }
+
+    // Re-resolve the surface in a rAF: ThemeProvider's applyTheme repaints the
+    // CSS vars in a sibling effect that runs after this one, so reading now
+    // would lag a mode behind. By the next frame the vars are current.
+    const raf = requestAnimationFrame(() => {
+      term.options.theme = withSurface(activeTheme)
+      // The WebGL renderer caches glyph colors in a texture atlas, so a
+      // light/dark switch leaves already-drawn cells stale until the atlas is
+      // cleared. No-op for the DOM fallback.
+      webglRef.current?.clearTextureAtlas()
+    })
+
+    return () => cancelAnimationFrame(raf)
+  }, [activeTheme, themeName])
+
+  // Flush a queued command (e.g. a provider-disconnect) into the live session.
+  // Only active while open; the subscribe fires immediately, so a command set
+  // before this pane mounted runs as soon as the session is ready. Clearing the
+  // atom after writing stops a later remount from replaying a stale command.
+  useEffect(() => {
+    if (status !== 'open') {
+      return
+    }
+
+    return $terminalInjection.subscribe(command => {
+      const id = sessionIdRef.current
+
+      if (!command || !id) {
+        return
+      }
+
+      void window.hermesDesktop?.terminal?.write(id, `${command}\r`)
+      $terminalInjection.set(null)
+      termRef.current?.focus()
+    })
+  }, [status])
 
   return {
     addSelectionToChat,

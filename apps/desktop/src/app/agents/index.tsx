@@ -8,9 +8,9 @@ import { FadeText } from '@/components/ui/fade-text'
 import { AlertCircle, CheckCircle2, Sparkles } from '@/lib/icons'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
-import { $activeSessionId } from '@/store/session'
 import {
   $subagentsBySession,
+  allSubagents,
   buildSubagentTree,
   type SubagentNode,
   type SubagentStatus,
@@ -75,15 +75,13 @@ interface AgentsViewProps {
 }
 
 export function AgentsView({ onClose }: AgentsViewProps) {
-  const activeSessionId = useStore($activeSessionId)
+  const { t } = useI18n()
   const subagentsBySession = useStore($subagentsBySession)
 
-  const activeSubagents = useMemo(
-    () => (activeSessionId ? (subagentsBySession[activeSessionId] ?? []) : []),
-    [activeSessionId, subagentsBySession]
-  )
-
-  const tree = useMemo(() => buildSubagentTree(activeSubagents), [activeSubagents])
+  // Aggregate every session, matching the status-bar indicator — a subagent
+  // running in a background session must still be visible here, or the two
+  // desync ("Agents N running" vs an empty tree).
+  const tree = useMemo(() => buildSubagentTree(allSubagents(subagentsBySession)), [subagentsBySession])
 
   return (
     <OverlayView
@@ -351,7 +349,7 @@ function SubagentRow({ node, depth = 0, nowMs }: { node: SubagentNode; depth?: n
       </button>
 
       {visibleRows.length > 0 ? (
-        <div className="grid min-w-0 gap-1 pl-6">
+        <div className="grid min-w-0 gap-1 pl-6" data-selectable-text="true">
           {visibleRows.map((entry, i) => (
             <StreamLine
               active={running && i === visibleRows.length - 1}
@@ -365,8 +363,10 @@ function SubagentRow({ node, depth = 0, nowMs }: { node: SubagentNode; depth?: n
       ) : null}
 
       {open && fileLines.length > 0 ? (
-        <div className="grid min-w-0 gap-0.5 pl-6">
-          <p className="text-[0.58rem] font-medium tracking-wider text-muted-foreground/60 uppercase">Files</p>
+        <div className="grid min-w-0 gap-0.5 pl-6" data-selectable-text="true">
+          <p className="text-[0.58rem] font-medium tracking-wider text-muted-foreground/60 uppercase">
+            {t.agents.files}
+          </p>
           {fileLines.slice(0, 8).map(line => (
             <p className="wrap-break-word font-mono text-[0.67rem] leading-relaxed text-muted-foreground/80" key={line}>
               {line}

@@ -21,6 +21,7 @@ import { getSessionMessages, listSessions } from '@/hermes'
 import { sessionTitle } from '@/lib/chat-runtime'
 import { ExternalLink, ExternalLinkIcon, hostPathLabel, urlSlugTitleLabel, useLinkTitle } from '@/lib/external-link'
 import { FileImage, FileText, FolderOpen, Link2 } from '@/lib/icons'
+import { mediaExternalUrl } from '@/lib/media'
 import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
 import type { SessionInfo, SessionMessage } from '@/types/hermes'
@@ -120,17 +121,12 @@ function artifactKind(value: string): ArtifactKind {
 }
 
 function artifactHref(value: string): string {
-  if (
-    value.startsWith('http://') ||
-    value.startsWith('https://') ||
-    value.startsWith('file://') ||
-    value.startsWith('data:')
-  ) {
+  if (value.startsWith('http://') || value.startsWith('https://') || value.startsWith('data:')) {
     return value
   }
 
-  if (value.startsWith('/')) {
-    return `file://${encodeURI(value)}`
+  if (value.startsWith('file://') || value.startsWith('/')) {
+    return mediaExternalUrl(value)
   }
 
   return value

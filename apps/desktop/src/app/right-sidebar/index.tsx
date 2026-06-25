@@ -4,6 +4,9 @@ import type { ReactNode } from 'react'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Loader } from '@/components/ui/loader'
+import { Tip } from '@/components/ui/tooltip'
+import { useI18n } from '@/i18n'
+import { selectDesktopPaths } from '@/lib/desktop-fs'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
@@ -166,6 +169,13 @@ interface FilesystemTabProps extends FileTreeBodyProps {
   onRefresh: () => void
 }
 
+// Sidebar palette + hover-reveal: header actions stay reachable while moving
+// from the project label to the action buttons.
+const HEADER_ACTION_CLASS =
+  'text-sidebar-foreground/70 hover:bg-sidebar-accent! hover:text-sidebar-accent-foreground! focus-visible:ring-sidebar-ring'
+
+const HEADER_ACTION_LABEL_REVEAL = `${HEADER_ACTION_CLASS} pointer-events-none opacity-0 transition-opacity focus-visible:pointer-events-auto focus-visible:opacity-100 group-focus-within/project-header:pointer-events-auto group-focus-within/project-header:opacity-100 group-hover/project-header:pointer-events-auto group-hover/project-header:opacity-100`
+
 function FilesystemTab({
   cwd,
   cwdName,
@@ -185,25 +195,50 @@ function FilesystemTab({
   return (
     <div className="group/project-header flex min-h-0 flex-1 flex-col">
       <RightSidebarSectionHeader>
-        <button
-          className="flex min-w-0 flex-1 items-center rounded-md text-left hover:text-(--ui-text-secondary)"
-          onClick={() => void onChangeFolder()}
-          title={hasCwd ? cwd : 'No folder selected'}
-          type="button"
-        >
-          <SidebarPanelLabel>{cwdName}</SidebarPanelLabel>
-        </button>
-        <Button
-          aria-label="Refresh tree"
-          className="pointer-events-none size-6 shrink-0 rounded-md text-sidebar-foreground/70 opacity-0 transition-opacity hover:bg-sidebar-accent! hover:text-sidebar-accent-foreground! focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-sidebar-ring group-focus-within/project-header:pointer-events-auto group-focus-within/project-header:opacity-100 group-hover/project-header:pointer-events-auto group-hover/project-header:opacity-100"
-          disabled={!hasCwd || loading}
-          onClick={onRefresh}
-          size="icon"
-          title="Refresh tree"
-          variant="ghost"
-        >
-          <Codicon name="refresh" size="0.8125rem" spinning={loading} />
-        </Button>
+        <div className="flex min-w-0 flex-1">
+          <button
+            className="flex w-full min-w-0 items-center rounded-md text-left hover:text-(--ui-text-secondary)"
+            onClick={() => void onChangeFolder()}
+            type="button"
+          >
+            <SidebarPanelLabel>{cwdName}</SidebarPanelLabel>
+          </button>
+        </div>
+        <Tip label={r.refreshTree} side="left">
+          <Button
+            aria-label={r.refreshTree}
+            className={HEADER_ACTION_LABEL_REVEAL}
+            disabled={!hasCwd || loading}
+            onClick={onRefresh}
+            size="icon-xs"
+            variant="ghost"
+          >
+            <Codicon name="refresh" size="0.8125rem" spinning={loading} />
+          </Button>
+        </Tip>
+        <Tip label={r.openFolder} side="left">
+          <Button
+            aria-label={r.openFolder}
+            className={HEADER_ACTION_CLASS}
+            onClick={() => void onChangeFolder()}
+            size="icon-xs"
+            variant="ghost"
+          >
+            <Codicon name="folder-opened" size="0.8125rem" />
+          </Button>
+        </Tip>
+        <Tip label={r.collapseAll} side="left">
+          <Button
+            aria-label={r.collapseAll}
+            className={cn(HEADER_ACTION_CLASS, !canCollapse && 'pointer-events-none opacity-0')}
+            disabled={!hasCwd || !canCollapse}
+            onClick={onCollapseAll}
+            size="icon-xs"
+            variant="ghost"
+          >
+            <Codicon name="collapse-all" size="0.8125rem" />
+          </Button>
+        </Tip>
       </RightSidebarSectionHeader>
       <FileTreeBody
         cwd={cwd}
@@ -222,7 +257,7 @@ function FilesystemTab({
 }
 
 export function RightSidebarSectionHeader({ children }: { children: ReactNode }) {
-  return <div className="flex h-7 shrink-0 items-center px-2">{children}</div>
+  return <div className="group/project-header flex h-7 shrink-0 items-center px-2.5">{children}</div>
 }
 
 interface FileTreeBodyProps {

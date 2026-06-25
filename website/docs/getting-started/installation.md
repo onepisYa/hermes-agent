@@ -9,6 +9,8 @@ description: "Install Hermes Agent on Linux, macOS, WSL2, native Windows, or And
 Get Hermes Agent up and running in under two minutes with the one-line installer.
 
 ## Quick Install
+### With the Hermes Desktop installer on macOS or Windows (recommended)
+To easily install the command-line and desktop applications, [download the Hermes Desktop installer](https://hermes-agent.nousresearch.com/) from our website and run it.
 
 ### Desktop App (macOS + Windows)
 
@@ -129,9 +131,7 @@ That logs you in, sets Nous as your provider, and turns on the Tool Gateway in o
 
 ## Prerequisites
 
-**pip install:** No prerequisites beyond Python 3.11+. Everything else is handled automatically.
-
-**Git installer:** The only prerequisite is **Git**. The installer automatically handles everything else:
+**Installer:** On non-Windows platforms, the only prerequisite is **Git**. On Linux, also make sure `curl` and `xz-utils` are available (the installer downloads Node.js as a `.tar.xz` archive). The desktop app additionally requires `g++` (or `build-essential` on Debian/Ubuntu) to compile native modules. The installer automatically handles everything else:
 
 - **uv** (fast Python package manager)
 - **Python 3.11** (via uv, no sudo needed)
@@ -140,7 +140,7 @@ That logs you in, sets Nous as your provider, and turns on the Tool Gateway in o
 - **ffmpeg** (audio format conversion for TTS)
 
 :::info
-You do **not** need to install Python, Node.js, ripgrep, or ffmpeg manually. The installer detects what's missing and installs it for you. Just make sure `git` is available (`git --version`).
+You do **not** need to install Python, Node.js, ripgrep, or ffmpeg manually. The installer detects what's missing and installs it for you. Just make sure `git` is available (`git --version`). On Linux, ensure `curl` and `xz-utils` are installed (`sudo apt install curl xz-utils` on Debian/Ubuntu). For the desktop app, also install `build-essential` (`sudo apt install build-essential`).
 :::
 
 :::tip Nix users

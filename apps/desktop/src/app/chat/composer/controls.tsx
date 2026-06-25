@@ -5,6 +5,7 @@ import { AudioLines, Layers3, Loader2, Square } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 
 import type { ConversationStatus } from './hooks/use-voice-conversation'
+import { ModelPill } from './model-pill'
 import type { ChatBarState, VoiceStatus } from './types'
 
 export const ICON_BTN = 'size-(--composer-control-size) shrink-0 rounded-md'
@@ -37,6 +38,7 @@ export function ComposerControls({
   busy,
   busyAction,
   canSubmit,
+  compactModelPill = false,
   conversation,
   disabled,
   hasComposerPayload,
@@ -47,6 +49,7 @@ export function ComposerControls({
   busy: boolean
   busyAction: 'queue' | 'stop'
   canSubmit: boolean
+  compactModelPill?: boolean
   conversation: ConversationProps
   disabled: boolean
   hasComposerPayload: boolean
@@ -54,6 +57,18 @@ export function ComposerControls({
   voiceStatus: VoiceStatus
   onDictate: () => void
 }) {
+  const { t } = useI18n()
+  const c = t.composer
+  const steerCombo = formatCombo('mod+enter')
+  const steerLabel = `${c.steer} (${steerCombo})`
+
+  const steerTip = (
+    <span className="inline-flex items-center gap-1.5">
+      {c.steer}
+      <KbdCombo combo="mod+enter" size="sm" variant="inverted" />
+    </span>
+  )
+
   if (conversation.active) {
     return <ConversationPill {...conversation} disabled={disabled} />
   }
@@ -62,40 +77,61 @@ export function ComposerControls({
 
   return (
     <div className="ml-auto flex shrink-0 items-center gap-(--composer-control-gap)">
-      <DictationButton disabled={disabled} onToggle={onDictate} state={state.voice} status={voiceStatus} />
-      {showVoicePrimary ? (
-        <Button
-          aria-label="Start voice conversation"
-          className={PRIMARY_ICON_BTN}
-          disabled={disabled}
-          onClick={() => {
-            triggerHaptic('open')
-            conversation.onStart()
-          }}
-          size="icon"
-          title="Start voice conversation"
-          type="button"
-        >
-          <AudioLines size={17} />
-        </Button>
+      <ModelPill compact={compactModelPill} disabled={disabled} model={state.model} />
+      {/* While the agent runs and the user is typing, steer takes over the mic's
+          slot rather than crowding the row with an extra button. */}
+      {canSteer ? (
+        <Tip label={steerTip}>
+          <Button
+            aria-label={steerLabel}
+            className={GHOST_ICON_BTN}
+            disabled={disabled}
+            onClick={onSteer}
+            size="icon"
+            type="button"
+            variant="ghost"
+          >
+            <SteeringWheel size={14} />
+          </Button>
+        </Tip>
       ) : (
-        <Button
-          aria-label={busy ? (busyAction === 'queue' ? 'Queue message' : 'Stop') : 'Send'}
-          className={PRIMARY_ICON_BTN}
-          disabled={disabled || !canSubmit}
-          title={busy ? (busyAction === 'queue' ? 'Queue message' : 'Stop') : 'Send'}
-          type="submit"
-        >
-          {busy ? (
-            busyAction === 'queue' ? (
-              <Layers3 size={16} />
+        <DictationButton disabled={disabled} onToggle={onDictate} state={state.voice} status={voiceStatus} />
+      )}
+      {showVoicePrimary ? (
+        <Tip label={c.startVoice}>
+          <Button
+            aria-label={c.startVoice}
+            className={PRIMARY_ICON_BTN}
+            disabled={disabled}
+            onClick={() => {
+              triggerHaptic('open')
+              conversation.onStart()
+            }}
+            size="icon"
+            type="button"
+          >
+            <AudioLines size={15} />
+          </Button>
+        </Tip>
+      ) : (
+        <Tip label={busy ? (busyAction === 'queue' ? c.queueMessage : c.stop) : c.send}>
+          <Button
+            aria-label={busy ? (busyAction === 'queue' ? c.queueMessage : c.stop) : c.send}
+            className={PRIMARY_ICON_BTN}
+            disabled={disabled || !canSubmit}
+            type="submit"
+          >
+            {busy ? (
+              busyAction === 'queue' ? (
+                <Layers3 size={14} />
+              ) : (
+                <span className="block size-2.5 rounded-[0.1875rem] bg-current" />
+              )
             ) : (
-              <span className="block size-3 rounded-[0.1875rem] bg-current" />
-            )
-          ) : (
-            <Codicon name="arrow-up" size="1rem" />
-          )}
-        </Button>
+              <Codicon name="arrow-up" size="0.875rem" />
+            )}
+          </Button>
+        </Tip>
       )}
     </div>
   )
@@ -224,34 +260,35 @@ function DictationButton({
     status === 'recording' ? 'Stop dictation' : status === 'transcribing' ? 'Transcribing dictation' : 'Voice dictation'
 
   return (
-    <Button
-      aria-label={aria}
-      aria-pressed={active}
-      className={cn(
-        GHOST_ICON_BTN,
-        'p-0',
-        'data-[active=true]:bg-accent data-[active=true]:text-foreground',
-        status === 'recording' && 'bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary',
-        status === 'transcribing' && 'bg-primary/10 text-primary'
-      )}
-      data-active={active}
-      disabled={disabled || !state.enabled || status === 'transcribing'}
-      onClick={() => {
-        triggerHaptic(active ? 'close' : 'open')
-        onToggle()
-      }}
-      size="icon"
-      title={aria}
-      type="button"
-      variant="ghost"
-    >
-      {status === 'recording' ? (
-        <Square className="fill-current" size={12} />
-      ) : status === 'transcribing' ? (
-        <Loader2 className="animate-spin" size={16} />
-      ) : (
-        <Codicon name="mic" size="1rem" />
-      )}
-    </Button>
+    <Tip label={aria}>
+      <Button
+        aria-label={aria}
+        aria-pressed={active}
+        className={cn(
+          GHOST_ICON_BTN,
+          'p-0',
+          'data-[active=true]:bg-accent data-[active=true]:text-foreground',
+          status === 'recording' && 'bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary',
+          status === 'transcribing' && 'bg-primary/10 text-primary'
+        )}
+        data-active={active}
+        disabled={disabled || !state.enabled || status === 'transcribing'}
+        onClick={() => {
+          triggerHaptic(active ? 'close' : 'open')
+          onToggle()
+        }}
+        size="icon"
+        type="button"
+        variant="ghost"
+      >
+        {status === 'recording' ? (
+          <Square className="fill-current" size={11} />
+        ) : status === 'transcribing' ? (
+          <Loader2 className="animate-spin" size={14} />
+        ) : (
+          <Codicon name="mic" size="0.875rem" />
+        )}
+      </Button>
+    </Tip>
   )
 }

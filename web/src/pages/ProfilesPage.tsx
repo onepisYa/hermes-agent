@@ -5,6 +5,8 @@ import {
   useRef,
   useState,
 } from "react";
+import { useNavigate } from "react-router-dom";
+import { useProfileScope } from "@/contexts/useProfileScope";
 import {
   ChevronDown,
   Pencil,
@@ -27,6 +29,10 @@ import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Label } from "@nous-research/ui/ui/components/label";
+import {
+  Select,
+  SelectOption,
+} from "@nous-research/ui/ui/components/select";
 import { Checkbox } from "@nous-research/ui/ui/components/checkbox";
 import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
@@ -71,11 +77,64 @@ export default function ProfilesPage() {
   const { toast, showToast } = useToast();
   const { t } = useI18n();
   const { setEnd } = usePageHeader();
+  const { setProfile } = useProfileScope();
+
+  // Locale strings with English fallbacks. The enriched keys are optional in
+  // the i18n type so untranslated locales don't break the build — they render
+  // the English literal until translated.
+  const L = useMemo(() => {
+    const p = t.profiles;
+    return {
+      activeProfile: p.activeProfile ?? "Active profile",
+      activeBadge: p.activeBadge ?? "active",
+      setActive: p.setActive ?? "Set as active",
+      activeSet: p.activeSet ?? "Active profile set",
+      gatewayRunning: p.gatewayRunning ?? "Gateway running",
+      gatewayStopped: p.gatewayStopped ?? "Gateway stopped",
+      gatewayRunningWarning:
+        p.gatewayRunningWarning ??
+        "This profile's gateway is running — it will be stopped.",
+      aliasBadge: p.aliasBadge ?? "alias",
+      description: p.description ?? "Description",
+      descriptionPlaceholder:
+        p.descriptionPlaceholder ??
+        "What is this profile good at? Used to route kanban tasks by role.",
+      noDescription: p.noDescription ?? "No description",
+      editDescription: p.editDescription ?? "Edit description",
+      descriptionSaved: p.descriptionSaved ?? "Description saved",
+      reviewBadge: p.reviewBadge ?? "review",
+      autoGenerate: p.autoGenerate ?? "Auto-generate",
+      generating: p.generating ?? "Generating…",
+      describeFailed: p.describeFailed ?? "Could not generate description",
+      distribution: p.distribution ?? "Distribution",
+      advancedOptions: p.advancedOptions ?? "Advanced options",
+      cloneAll:
+        p.cloneAll ?? "Clone everything (memories, sessions, skills, state)",
+      noSkillsOption: p.noSkillsOption ?? "Don't seed bundled skills",
+      descriptionOptional: p.descriptionOptional ?? "Description (optional)",
+      modelOptional: p.modelOptional ?? "Model (optional)",
+      modelInherit: p.modelInherit ?? "Inherit from clone / default",
+      modelLoading: p.modelLoading ?? "Loading models…",
+      modelNone:
+        p.modelNone ?? "No authenticated providers — set a key first",
+      editModel: p.editModel ?? "Change model",
+      modelSaved: p.modelSaved ?? "Model updated",
+      modelSelect: p.modelSelect ?? "Select a model",
+      actions: p.actions ?? "Actions",
+      manageSkills: p.manageSkills ?? "Manage skills & tools",
+      activeSetHint:
+        p.activeSetHint ??
+        "Dashboard switched to manage {name}. New CLI/gateway runs will use this profile too.",
+    };
+  }, [t.profiles]);
 
   // Create modal
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [newName, setNewName] = useState("");
-  const [cloneFromDefault, setCloneFromDefault] = useState(true);
+  const [cloneFrom, setCloneFrom] = useState<string | null>("default");
+  const [cloneAll, setCloneAll] = useState(false);
+  const [noSkills, setNoSkills] = useState(false);
+  const [newDescription, setNewDescription] = useState("");
   const [creating, setCreating] = useState(false);
   const closeCreateModal = useCallback(() => setCreateModalOpen(false), []);
   const createModalRef = useModalBehavior({
@@ -119,9 +178,28 @@ export default function ProfilesPage() {
     }
     setCreating(true);
     try {
-      await api.createProfile({ name, clone_from_default: cloneFromDefault });
+      const cloning = cloneFrom !== null;
+      const picked = modelChoice
+        ? modelChoices?.find(
+            (c) => `${c.provider}\u0000${c.model}` === modelChoice,
+          )
+        : undefined;
+      const res = await api.createProfile({
+        name,
+        clone_from: cloneFrom,
+        clone_all: cloning && cloneAll,
+        no_skills: cloning ? false : noSkills,
+        description: newDescription.trim() || undefined,
+        provider: picked?.provider,
+        model: picked?.model,
+      });
       showToast(`${t.profiles.created}: ${name}`, "success");
       setNewName("");
+      setNewDescription("");
+      setNoSkills(false);
+      setCloneAll(false);
+      setCloneFrom("default");
+      setModelChoice("");
       setCreateModalOpen(false);
       load();
     } catch (e) {
@@ -156,6 +234,36 @@ export default function ProfilesPage() {
       showToast(`${t.status.error}: ${e}`, "error");
     }
   };
+
+  const handleSetActive = async (name: string) => {
+    setSettingActive(name);
+    try {
+      // The backend normalizes/validates the name; trust the canonical
+      // value it returns rather than the raw input.
+      const { active } = await api.setActiveProfile(name);
+      setProfile(active);
+      showToast(
+        `${L.activeSet}: ${active} — ${L.activeSetHint.replace("{name}", active)}`,
+        "success",
+      );
+      setActiveInfo((prev) =>
+        prev ? { ...prev, active } : { active, current: active },
+      );
+    } catch (e) {
+      showToast(`${t.status.error}: ${e}`, "error");
+    } finally {
+      setSettingActive(null);
+    }
+  };
+
+  // Closes whichever editor dialog is open (model / description / SOUL).
+  const closeEditor = useCallback(() => {
+    activeSoulRequest.current = null;
+    activeDescRequest.current = null;
+    setEditingModelFor(null);
+    setEditingDescFor(null);
+    setEditingSoulFor(null);
+  }, []);
 
   const openSoulEditor = useCallback(
     async (name: string) => {
@@ -242,7 +350,9 @@ export default function ProfilesPage() {
     return () => {
       setEnd(null);
     };
-  }, [setEnd, t.common.create, loading]);
+  }, [setEnd, t.common.create, loading, navigate]);
+
+  const cloning = cloneFrom !== null;
 
   if (loading) {
     return (
@@ -329,13 +439,37 @@ export default function ProfilesPage() {
                 </p>
               </div>
 
-              <div className="flex items-center gap-2.5">
-                <Checkbox
-                  checked={cloneFromDefault}
-                  id="clone-from-default"
-                  onCheckedChange={(checked) =>
-                    setCloneFromDefault(checked === true)
-                  }
+              <div className="grid gap-2">
+                <Label htmlFor="clone-from">{t.profiles.cloneFrom}</Label>
+                <Select
+                  id="clone-from"
+                  value={cloneFrom ?? ""}
+                  onValueChange={(v) => {
+                    const next = v || null;
+                    setCloneFrom(next);
+                    if (next === null) setCloneAll(false);
+                  }}
+                >
+                  <SelectOption value="">{t.profiles.cloneFromNone}</SelectOption>
+                  {profiles.map((profile) => (
+                    <SelectOption key={profile.name} value={profile.name}>
+                      {profile.name}
+                    </SelectOption>
+                  ))}
+                </Select>
+              </div>
+
+              <div className="grid gap-2">
+                <Label htmlFor="profile-description">
+                  {L.descriptionOptional}
+                </Label>
+
+                <textarea
+                  id="profile-description"
+                  className="flex min-h-[64px] w-full border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  placeholder={L.descriptionPlaceholder}
+                  value={newDescription}
+                  onChange={(e) => setNewDescription(e.target.value)}
                 />
 
                 <Label
@@ -345,6 +479,50 @@ export default function ProfilesPage() {
                   {t.profiles.cloneFromDefault}
                 </Label>
               </div>
+
+              <fieldset className="grid gap-3 border-t border-border pt-4">
+                <legend className="font-mondwest text-display text-xs tracking-wider text-muted-foreground">
+                  {L.advancedOptions}
+                </legend>
+
+                <div className="flex items-center gap-2.5">
+                  <Checkbox
+                    checked={cloneAll}
+                    disabled={!cloning}
+                    id="clone-all"
+                    onCheckedChange={(checked) => setCloneAll(checked === true)}
+                  />
+
+                  <Label
+                    className={cn(
+                      "font-mondwest normal-case tracking-normal text-sm cursor-pointer",
+                      !cloning && "opacity-50",
+                    )}
+                    htmlFor="clone-all"
+                  >
+                    {L.cloneAll}
+                  </Label>
+                </div>
+
+                <div className="flex items-center gap-2.5">
+                  <Checkbox
+                    checked={noSkills}
+                    id="no-skills"
+                    disabled={cloning}
+                    onCheckedChange={(checked) => setNoSkills(checked === true)}
+                  />
+
+                  <Label
+                    className={cn(
+                      "font-mondwest normal-case tracking-normal text-sm cursor-pointer",
+                      cloning && "opacity-50",
+                    )}
+                    htmlFor="no-skills"
+                  >
+                    {L.noSkillsOption}
+                  </Label>
+                </div>
+              </fieldset>
 
               <div className="flex justify-end">
                 <Button

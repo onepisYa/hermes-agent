@@ -33,6 +33,39 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/curator')).toBe(false)
   })
 
+  it('surfaces /tools, /save, and /personality on the desktop', () => {
+    expect(isDesktopSlashSuggestion('/tools')).toBe(true)
+    expect(isDesktopSlashSuggestion('/save')).toBe(true)
+    expect(isDesktopSlashSuggestion('/personality')).toBe(true)
+    expect(isDesktopSlashCommand('/tools')).toBe(true)
+    expect(isDesktopSlashCommand('/save')).toBe(true)
+    expect(isDesktopSlashCommand('/personality')).toBe(true)
+    expect(desktopSlashUnavailableMessage('/tools')).toBeNull()
+    expect(desktopSlashUnavailableMessage('/save')).toBeNull()
+    expect(desktopSlashUnavailableMessage('/personality')).toBeNull()
+  })
+
+  it('routes /pet through the desktop action handler and drops /pets', () => {
+    expect(resolveDesktopCommand('/pet')?.surface).toEqual({ kind: 'action', action: 'pet' })
+    expect(resolveDesktopCommand('/pet')?.args).toBe(true)
+    expect(isDesktopSlashSuggestion('/pet')).toBe(true)
+    expect(isDesktopSlashCommand('/pet')).toBe(true)
+    expect(resolveDesktopCommand('/pets')?.surface).toEqual({ kind: 'unavailable', reason: 'settings' })
+    expect(isDesktopSlashSuggestion('/pets')).toBe(false)
+    expect(isDesktopSlashCommand('/pets')).toBe(false)
+  })
+
+  it('treats /browser as an executable action command (local-gateway connect)', () => {
+    // /browser used to be terminal-only; it now resolves to a desktop action
+    // handler that routes browser.manage RPC when the gateway is local.
+    expect(isDesktopSlashCommand('/browser')).toBe(true)
+    expect(isDesktopSlashSuggestion('/browser')).toBe(true)
+    expect(desktopSlashUnavailableMessage('/browser')).toBeNull()
+    expect(resolveDesktopCommand('/browser')?.surface).toEqual({ kind: 'action', action: 'browser' })
+    // Bare /browser expands to its sub-action options in the popover.
+    expect(resolveDesktopCommand('/browser')?.args).toBe(true)
+  })
+
   it('allows aliases to execute without cluttering the popover', () => {
     expect(isDesktopSlashSuggestion('/reset')).toBe(false)
     expect(isDesktopSlashCommand('/reset')).toBe(true)

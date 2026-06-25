@@ -13,6 +13,7 @@ import {
   DialogTitle
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import {
   createProfile,
@@ -108,15 +109,15 @@ export function ProfilesView({
   }, [profiles, selectedName])
 
   const handleCreate = useCallback(
-    async (name: string, cloneFromDefault: boolean) => {
+    async (name: string, cloneFrom: null | string) => {
       const trimmed = name.trim()
 
       if (!isValidProfileName(trimmed)) {
         throw new Error(PROFILE_NAME_HINT)
       }
 
-      await createProfile({ name: trimmed, clone_from_default: cloneFromDefault })
-      notify({ kind: 'success', title: 'Profile created', message: trimmed })
+      await createProfile({ name: trimmed, clone_from: cloneFrom })
+      notify({ kind: 'success', title: p.created, message: trimmed })
       setSelectedName(trimmed)
       await refresh()
     },
@@ -222,10 +223,11 @@ export function ProfilesView({
       </div>
 
       <CreateProfileDialog
-        onClose={() => setCreateOpen(false)}
-        onCreate={async (name, cloneFromDefault) => handleCreate(name, cloneFromDefault)}
-        open={createOpen}
-      />
+          onClose={() => setCreateOpen(false)}
+          onCreate={async (name, cloneFrom) => handleCreate(name, cloneFrom)}
+          open={createOpen}
+          profiles={profiles ?? []}
+        />
 
       <Dialog onOpenChange={open => !open && !deleting && setPendingDelete(null)} open={pendingDelete !== null}>
         <DialogContent className="max-w-md">
@@ -490,14 +492,16 @@ function SoulEditor({ profileName }: { profileName: string }) {
 function CreateProfileDialog({
   onClose,
   onCreate,
-  open
+  open,
+  profiles
 }: {
   onClose: () => void
-  onCreate: (name: string, cloneFromDefault: boolean) => Promise<void>
+  onCreate: (name: string, cloneFrom: null | string) => Promise<void>
   open: boolean
+  profiles: ProfileInfo[]
 }) {
   const [name, setName] = useState('')
-  const [cloneFromDefault, setCloneFromDefault] = useState(true)
+  const [cloneFrom, setCloneFrom] = useState<null | string>('default')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<null | string>(null)
 
@@ -507,7 +511,7 @@ function CreateProfileDialog({
     }
 
     setName('')
-    setCloneFromDefault(true)
+    setCloneFrom('default')
     setError(null)
     setSaving(false)
   }, [open])
@@ -528,7 +532,7 @@ function CreateProfileDialog({
     setError(null)
 
     try {
-      await onCreate(trimmed, cloneFromDefault)
+      await onCreate(trimmed, cloneFrom)
       onClose()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create profile')
@@ -565,20 +569,25 @@ function CreateProfileDialog({
             </p>
           </div>
 
-          <label className="flex cursor-pointer items-center gap-2 rounded-md border border-border/40 bg-background/50 px-3 py-2 text-sm">
-            <input
-              checked={cloneFromDefault}
-              className="size-4 accent-primary"
-              onChange={event => setCloneFromDefault(event.target.checked)}
-              type="checkbox"
-            />
-            <span>
-              <span className="font-medium">Clone from default</span>
-              <span className="ml-2 text-xs text-muted-foreground">
-                Copy config, skills, and SOUL.md from your default profile.
-              </span>
-            </span>
-          </label>
+          <div className="grid gap-1.5">
+            <label className="text-xs font-medium" htmlFor="new-profile-clone-from">
+              {p.cloneFrom}
+            </label>
+            <Select onValueChange={value => setCloneFrom(value === '__none__' ? null : value)} value={cloneFrom ?? '__none__'}>
+              <SelectTrigger className="h-9 rounded-md" id="new-profile-clone-from">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__none__">{p.cloneFromNone}</SelectItem>
+                {profiles.map(profile => (
+                  <SelectItem key={profile.name} value={profile.name}>
+                    {profile.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">{p.cloneFromDesc}</p>
+          </div>
 
           {error && (
             <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">

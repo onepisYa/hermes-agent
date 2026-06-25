@@ -17,9 +17,32 @@ import { notify, notifyError } from '@/store/notifications'
 import type { ConfigFieldSchema, HermesConfigRecord } from '@/types/hermes'
 
 import { CONTROL_TEXT, EMPTY_SELECT_VALUE, FIELD_DESCRIPTIONS, FIELD_LABELS, SECTIONS } from './constants'
-import { enumOptionsFor, getNested, includesQuery, prettyName, setNested } from './helpers'
+import { fieldCopyForSchemaKey } from './field-copy'
+import { enumOptionsFor, getNested, prettyName, setNested } from './helpers'
+import { MemoryConnect } from './memory/connect'
+import { ModelSettings } from './model-settings'
 import { EmptyState, ListRow, LoadingState, SettingsContent } from './primitives'
-import type { SearchProps } from './types'
+import { ProviderConfigPanel } from './provider-config-panel'
+
+// On the Voice page, only surface the sub-fields of the *selected* TTS/STT
+// provider — otherwise every provider's options render at once (the "totally
+// crazy" wall of ~30 fields). Top-level keys (tts.provider, stt.enabled,
+// voice.*) always show; STT provider fields hide entirely when STT is off.
+export function voiceFieldVisible(key: string, config: HermesConfigRecord): boolean {
+  const match = /^(tts|stt)\.([^.]+)\./.exec(key)
+
+  if (!match) {
+    return true
+  }
+
+  const [, domain, provider] = match
+
+  if (domain === 'stt' && !getNested(config, 'stt.enabled')) {
+    return false
+  }
+
+  return provider === String(getNested(config, `${domain}.provider`) ?? '')
+}
 
 function ConfigField({
   schemaKey,
@@ -27,7 +50,8 @@ function ConfigField({
   value,
   enumOptions,
   optionLabels,
-  onChange
+  onChange,
+  descriptionExtra
 }: {
   schemaKey: string
   schema: ConfigFieldSchema
@@ -35,6 +59,7 @@ function ConfigField({
   enumOptions?: string[]
   optionLabels?: Record<string, string>
   onChange: (value: unknown) => void
+  descriptionExtra?: ReactNode
 }) {
   const label = FIELD_LABELS[schemaKey] ?? prettyName(schemaKey.split('.').pop() ?? schemaKey)
   const normalize = (v: string) => v.toLowerCase().replace(/[^a-z0-9]+/g, '')
@@ -46,8 +71,17 @@ function ConfigField({
       ? rawDescription
       : undefined
 
+  const descriptionNode: ReactNode = descriptionExtra ? (
+    <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
+      {description}
+      {descriptionExtra}
+    </span>
+  ) : (
+    description
+  )
+
   const row = (action: ReactNode, wide = false) => (
-    <ListRow action={action} description={description} title={label} wide={wide} />
+    <ListRow action={action} description={descriptionNode} title={label} wide={wide} />
   )
 
   if (schema.type === 'boolean') {
@@ -320,6 +354,9 @@ export function ConfigSettings({
     return <LoadingState label="Loading Hermes configuration..." />
   }
 
+  const visibleFields =
+    activeSectionId === 'voice' ? fields.filter(([key]) => voiceFieldVisible(key, config)) : fields
+
   return (
     <SettingsContent>
       {query.trim() && (
@@ -327,24 +364,33 @@ export function ConfigSettings({
           {fields.length} result{fields.length === 1 ? '' : 's'}
         </div>
       )}
-      {fields.length === 0 ? (
-        <EmptyState description="Try a different search term or choose another section." title="No matching settings" />
+      {visibleFields.length === 0 ? (
+        <EmptyState description={c.emptyDesc} title={c.emptyTitle} />
       ) : (
-        <div className="divide-y divide-border/40">
-          {fields.map(([key, field]) => (
-            <ConfigField
-              enumOptions={
-                key === 'tts.elevenlabs.voice_id'
-                  ? enumOptionsFor(key, getNested(config, key), config, elevenLabsVoiceOptions ?? undefined)
-                  : enumOptionsFor(key, getNested(config, key), config)
-              }
-              key={key}
-              onChange={value => updateConfig(setNested(config, key, value))}
-              optionLabels={key === 'tts.elevenlabs.voice_id' ? elevenLabsVoiceLabels : undefined}
-              schema={field}
-              schemaKey={key}
-              value={getNested(config, key)}
-            />
+        <div className="grid gap-1">
+          {visibleFields.map(([key, field]) => (
+            <div className="scroll-mt-6 rounded-lg" id={`setting-field-${key}`} key={key}>
+              <ConfigField
+                descriptionExtra={
+                  key === 'memory.provider' && Boolean(getNested(config, key)) ? (
+                    <MemoryConnect provider={String(getNested(config, key))} />
+                  ) : undefined
+                }
+                enumOptions={
+                  key === 'tts.elevenlabs.voice_id'
+                    ? enumOptionsFor(key, getNested(config, key), config, elevenLabsVoiceOptions ?? undefined)
+                    : enumOptionsFor(key, getNested(config, key), config)
+                }
+                onChange={value => updateConfig(setNested(config, key, value))}
+                optionLabels={key === 'tts.elevenlabs.voice_id' ? elevenLabsVoiceLabels : undefined}
+                schema={field}
+                schemaKey={key}
+                value={getNested(config, key)}
+              />
+              {key === 'memory.provider' && typeof getNested(config, key) === 'string' && getNested(config, key) ? (
+                <ProviderConfigPanel provider={String(getNested(config, key))} />
+              ) : null}
+            </div>
           ))}
         </div>
       )}

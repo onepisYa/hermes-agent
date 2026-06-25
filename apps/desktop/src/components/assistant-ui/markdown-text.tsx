@@ -9,8 +9,9 @@ import {
 import { code } from '@streamdown/code'
 import { type ComponentProps, memo, type ReactNode, useDeferredValue, useEffect, useMemo, useState } from 'react'
 
+import { ExpandableBlock } from '@/components/chat/expandable-block'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
-import { SyntaxHighlighter } from '@/components/chat/shiki-highlighter'
+import { chunkByLines, SyntaxHighlighter } from '@/components/chat/shiki-highlighter'
 import { ZoomableImage } from '@/components/chat/zoomable-image'
 import { normalizeExternalUrl, openExternalLink, PrettyLink } from '@/lib/external-link'
 import { createMemoizedMathPlugin } from '@/lib/katex-memo'
@@ -39,6 +40,55 @@ import { cn } from '@/lib/utils'
 // `singleDollarTextMath: true` enables `$x^2$` for inline math (de-facto
 // LLM convention). The default false-setting only accepts `$$...$$`.
 const mathPlugin = createMemoizedMathPlugin({ singleDollarTextMath: true })
+
+// Replaces Streamdown's `parseIncompleteMarkdown` (full-text remend per
+// flush) with a tail-bounded repair — see lib/remend-tail.ts. Must stay
+// module-scope so the prop identity is stable across renders.
+function preprocessWithTailRepair(text: string): string {
+  try {
+    return tailBoundedRemend(preprocessMarkdown(text))
+  } catch {
+    return text
+  }
+}
+
+// Memoized block splitter. Streamdown calls `parseMarkdownIntoBlocks` (a full
+// `marked` lex of the entire message, ~1.6ms per 28KB) inside a useMemo keyed
+// on the text — but the same text is re-lexed every time a message REMOUNTS
+// (virtualizer scroll, session switch) and whenever multiple surfaces render
+// the same content (deferred + smooth reveal republish). A small module-level
+// LRU keyed by the exact source string removes all of those repeat parses
+// with zero correctness risk (same input → same output). Streaming tail
+// growth misses the cache by design (every flush is a new string) — that
+// single lex is the irreducible cost.
+const BLOCK_CACHE_MAX = 64
+const BLOCK_CACHE_MIN_LENGTH = 1024
+const blockCache = new Map<string, string[]>()
+
+function parseMarkdownIntoBlocksCached(markdown: string): string[] {
+  if (markdown.length < BLOCK_CACHE_MIN_LENGTH) {
+    return parseMarkdownIntoBlocks(markdown)
+  }
+
+  const hit = blockCache.get(markdown)
+
+  if (hit) {
+    // Refresh recency (Map iteration order is insertion order).
+    blockCache.delete(markdown)
+    blockCache.set(markdown, hit)
+
+    return hit
+  }
+
+  const blocks = parseMarkdownIntoBlocks(markdown)
+  blockCache.set(markdown, blocks)
+
+  if (blockCache.size > BLOCK_CACHE_MAX) {
+    blockCache.delete(blockCache.keys().next().value as string)
+  }
+
+  return blocks
+}
 
 async function mediaSrc(path: string): Promise<string> {
   if (/^(?:https?|data):/i.test(path)) {
@@ -271,12 +321,41 @@ const HEADING_SIZES: Record<'h1' | 'h2' | 'h3' | 'h4', string> = {
 const MarkdownTextImpl = () => {
   const isStreaming = useAuiState(s => s.message.status?.type === 'running')
 
-  // Stable per-state plugin object. The previous inline `{ math: mathPlugin,
-  // ...(isStreaming ? {} : { code }) }` created a new object identity on every
-  // render, which churns Streamdown's outer memo + propagates new prop
-  // identities into every Block. The plugin set really only varies on
-  // `isStreaming`, so memoize on that.
-  const plugins = useMemo(() => (isStreaming ? { math: mathPlugin } : { math: mathPlugin, code }), [isStreaming])
+const MAX_MARKDOWN_CHARS = 200_000
+
+function HugeTextFallback({ containerClassName, text }: { containerClassName?: string; text: string }) {
+  const chunks = useMemo(() => chunkByLines(text, 200), [text])
+
+  return (
+    <div
+      className={cn(
+        'aui-md w-full max-w-none overflow-hidden rounded-[0.625rem] border border-border font-mono text-[0.7rem] leading-relaxed text-foreground/90',
+        containerClassName
+      )}
+    >
+      <ExpandableBlock className="p-2">
+        {chunks.map((chunk, index) => (
+          <div
+            className="[content-visibility:auto]"
+            key={index}
+            style={{ containIntrinsicSize: `auto ${chunk.lines * 16}px` }}
+          >
+            {chunk.text}
+          </div>
+        ))}
+      </ExpandableBlock>
+    </div>
+  )
+}
+
+function MarkdownTextSurface({ containerClassName, containerProps }: MarkdownTextSurfaceProps) {
+  const { status, text } = useMessagePartText()
+  const isStreaming = status.type === 'running'
+
+  // Keep code parsing enabled while streaming so incomplete fenced blocks still
+  // render as code cards. The expensive Shiki pass is deferred by
+  // `SyntaxHighlighter` below when `isStreaming` is true.
+  const plugins = useMemo(() => ({ math: mathPlugin, code }), [])
 
   const components = useMemo(
     () =>
@@ -297,20 +376,37 @@ const MarkdownTextImpl = () => {
           <p className={cn('my-1 wrap-anywhere leading-(--dt-line-height)', className)} {...props} />
         ),
         a: MarkdownLink,
-        hr: ({ className, ...props }: ComponentProps<'hr'>) => (
-          <hr className={cn('border-border', className)} {...props} />
+        // Inline code must not vote when an ancestor resolves `dir="auto"`
+        // (HTML's algorithm skips descendants that carry their own dir),
+        // mirroring the CSS isolate that already keeps it out of the
+        // plaintext scan. Fenced code never reaches this override; it goes
+        // through the code plugin's CodeCard path.
+        inlineCode: ({ className, ...props }: ComponentProps<'code'>) => (
+          <code className={className} dir="ltr" {...props} />
         ),
+        // `---` as quiet spacing, not a heavy full-width rule.
+        hr: (_props: ComponentProps<'hr'>) => <div aria-hidden className="my-3" />,
+        // Lists and blockquotes have chrome that sits *beside* the text
+        // (markers, the quote border), and that side is driven by the CSS
+        // `direction` of the box, which `unicode-bidi: plaintext` never
+        // touches — an RTL list otherwise renders its numbers stranded at
+        // the far left. `dir="auto"` lets the browser resolve the box
+        // direction from content; the plaintext rules in styles.css keep
+        // owning per-line text direction. Inline code carries `dir="ltr"`
+        // (see the `code` override) so it doesn't vote here either, same
+        // contract as the CSS isolate.
         blockquote: ({ className, ...props }: ComponentProps<'blockquote'>) => (
           <blockquote
-            className={cn('border-l-2 border-border pl-3 text-muted-foreground italic', className)}
+            className={cn('border-s-2 border-border ps-3 text-muted-foreground italic', className)}
+            dir="auto"
             {...props}
           />
         ),
         ul: ({ className, ...props }: ComponentProps<'ul'>) => (
-          <ul className={cn('my-1 gap-0', className)} {...props} />
+          <ul className={cn('my-1 gap-0', className)} dir="auto" {...props} />
         ),
         ol: ({ className, ...props }: ComponentProps<'ol'>) => (
-          <ol className={cn('my-1 gap-0', className)} {...props} />
+          <ol className={cn('my-1 gap-0', className)} dir="auto" {...props} />
         ),
         li: ({ className, ...props }: ComponentProps<'li'>) => (
           <li className={cn('leading-(--dt-line-height)', className)} {...props} />
@@ -346,6 +442,10 @@ const MarkdownTextImpl = () => {
       }) as StreamdownTextComponents,
     [isStreaming]
   )
+
+  if (text.length > MAX_MARKDOWN_CHARS) {
+    return <HugeTextFallback containerClassName={containerClassName} text={text} />
+  }
 
   return (
     <DeferStreamingText>

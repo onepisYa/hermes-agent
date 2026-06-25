@@ -867,12 +867,12 @@ export function CommandCenterView({
                         </div>
                       </div>
                       <div className="flex shrink-0 items-center gap-1.5 whitespace-nowrap">
-                        <OverlayActionButton className="h-7 px-2.5" onClick={() => void runSystemAction('restart')}>
-                          Restart messaging
-                        </OverlayActionButton>
-                        <OverlayActionButton className="h-7 px-2.5" onClick={() => void runSystemAction('update')}>
-                          Update Hermes
-                        </OverlayActionButton>
+                        <Button onClick={() => void runSystemAction('restart')} size="xs" variant="text">
+                          {cc.restartGateway}
+                        </Button>
+                        <Button onClick={() => void runSystemAction('update')} size="xs" variant="textStrong">
+                          {cc.updateHermes}
+                        </Button>
                       </div>
                     </div>
                     {systemAction && (
@@ -897,8 +897,11 @@ export function CommandCenterView({
                     </span>
                   )}
                 </div>
-                <pre className="h-full min-h-0 overflow-auto whitespace-pre-wrap wrap-break-word font-mono text-[0.65rem] leading-relaxed text-muted-foreground">
-                  {logs.length ? logs.join('\n') : 'No logs loaded yet.'}
+                <pre
+                  className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap wrap-break-word rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) p-3 font-mono text-[0.65rem] leading-relaxed text-(--ui-text-tertiary)"
+                  data-selectable-text="true"
+                >
+                  {logs.length ? logs.join('\n') : cc.noLogs}
                 </pre>
               </OverlayCard>
             </div>

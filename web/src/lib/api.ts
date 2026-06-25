@@ -41,6 +41,53 @@ function setSessionHeader(headers: Headers, token: string): void {
   }
 }
 
+// ── Global management-profile scope ──────────────────────────────────
+// The dashboard is a machine-level management surface: one header switcher
+// (ProfileProvider in App.tsx) decides which profile the management pages
+// read/write, and fetchJSON transparently appends ?profile=<name> to the
+// profile-scoped endpoint families below. "" = the dashboard process's own
+// profile (legacy behavior). Calls that already carry an explicit profile
+// (e.g. ProfileBuilder writes) are left untouched — explicit beats global.
+let _managementProfile = "";
+
+export function setManagementProfile(name: string): void {
+  _managementProfile = (name || "").trim();
+}
+
+export function getManagementProfile(): string {
+  return _managementProfile;
+}
+
+// Endpoint families that honor ?profile= on the backend (web_server.py
+// _profile_scope or explicit per-profile DB opens). Anything else — ops,
+// pairing, cron (which has its own per-job profile params), profiles
+// themselves — is machine-global or self-scoped and must NOT be rewritten.
+const PROFILE_SCOPED_PREFIXES = [
+  "/api/status",
+  "/api/gateway",
+  "/api/analytics",
+  "/api/skills",
+  "/api/tools/toolsets",
+  "/api/config",
+  "/api/env",
+  "/api/mcp",
+  "/api/messaging/platforms",
+  "/api/messaging/telegram/onboarding",
+  "/api/model/info",
+  "/api/model/set",
+  "/api/model/auxiliary",
+  "/api/model/options",
+];
+
+function withManagementProfile(url: string): string {
+  if (!_managementProfile) return url;
+  if (url.includes("profile=")) return url; // explicit param wins
+  const path = url.split("?")[0];
+  if (!PROFILE_SCOPED_PREFIXES.some((p) => path.startsWith(p))) return url;
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}profile=${encodeURIComponent(_managementProfile)}`;
+}
+
 export async function fetchJSON<T>(
   url: string,
   init?: RequestInit,
@@ -192,6 +239,76 @@ export async function buildWsAuthParam(): Promise<[string, string]> {
   return ["token", token];
 }
 
+/**
+ * Authenticated ``fetch`` for dashboard ``/api/...`` requests that aren't
+ * plain JSON — file uploads (``FormData``), binary downloads (blobs), etc.
+ * Mirrors ``fetchJSON``'s auth handling but returns the raw ``Response`` so
+ * the caller can read ``.blob()`` / ``.formData()`` / stream it.
+ *
+ * Auth, in both modes, exactly as ``fetchJSON`` does it:
+ *  - loopback / ``--insecure``: attach the ``X-Hermes-Session-Token`` header.
+ *  - gated OAuth: no token header (it's absent by design); the
+ *    ``hermes_session_at`` cookie rides along via ``credentials: 'include'``.
+ *
+ * Unlike ``fetchJSON`` this does NOT parse the body, does NOT throw on
+ * non-2xx (the caller decides — a 404 on a download is meaningful), and
+ * does NOT run the global 401 → /login redirect (binary endpoints aren't
+ * navigation targets). Callers that want the redirect behaviour should use
+ * ``fetchJSON``.
+ */
+export async function authedFetch(
+  url: string,
+  init?: RequestInit,
+): Promise<Response> {
+  const headers = new Headers(init?.headers);
+  const token = window.__HERMES_SESSION_TOKEN__;
+  if (token) {
+    setSessionHeader(headers, token);
+  }
+  return fetch(`${BASE}${url}`, {
+    ...init,
+    headers,
+    credentials: init?.credentials ?? "include",
+  });
+}
+
+/**
+ * Build an absolute ``ws(s)://`` URL for a dashboard WebSocket endpoint,
+ * with the correct auth query param appended for the active mode (fresh
+ * single-use ``ticket`` in gated mode, ``token`` in loopback). Plugins and
+ * the SPA should use this instead of hand-assembling a WS URL + reading
+ * ``window.__HERMES_SESSION_TOKEN__`` directly, so the gated-mode ticket
+ * path can never be forgotten.
+ *
+ * ``path`` is the dashboard-relative path (e.g.
+ * ``"/api/plugins/kanban/events"``); the base-path prefix and host are
+ * applied here. Extra query params can be supplied via ``params`` and are
+ * merged before the auth param.
+ */
+export async function buildWsUrl(
+  path: string,
+  params?: Record<string, string>,
+): Promise<string> {
+  const [authName, authValue] = await buildWsAuthParam();
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const qs = new URLSearchParams(params ?? {});
+  qs.set(authName, authValue);
+  return `${proto}//${window.location.host}${BASE}${path}?${qs}`;
+}
+
+/** Build a ``?profile=<name>`` query suffix, or "" when unset.
+ *
+ * Used by the skills/toolsets endpoints so the dashboard can manage a
+ * profile other than the one the server process runs under. */
+function profileQuery(profile?: string): string {
+  return profile ? `?profile=${encodeURIComponent(profile)}` : "";
+}
+
+function appendProfileParam(url: string, profile?: string): string {
+  if (!profile || url.includes("profile=")) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}profile=${encodeURIComponent(profile)}`;
+}
+
 export const api = {
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
   /**
@@ -226,17 +343,111 @@ export const api = {
       window.location.assign("/login");
       return r;
     }),
-  getSessions: (limit = 20, offset = 0) =>
-    fetchJSON<PaginatedSessions>(`/api/sessions?limit=${limit}&offset=${offset}`),
-  getSessionMessages: (id: string) =>
-    fetchJSON<SessionMessagesResponse>(`/api/sessions/${encodeURIComponent(id)}/messages`),
+  getSessions: (
+    limit = 20,
+    offset = 0,
+    profile = getManagementProfile(),
+    order: "created" | "recent" = "created",
+  ) =>
+    fetchJSON<PaginatedSessions>(
+      appendProfileParam(
+        `/api/sessions?limit=${limit}&offset=${offset}&order=${order}`,
+        profile,
+      ),
+    ),
+  getSessionMessages: (id: string, profile = getManagementProfile()) =>
+    fetchJSON<SessionMessagesResponse>(
+      appendProfileParam(`/api/sessions/${encodeURIComponent(id)}/messages`, profile),
+    ),
+  getSessionDetail: (id: string, profile = getManagementProfile()) =>
+    fetchJSON<SessionInfo>(
+      appendProfileParam(`/api/sessions/${encodeURIComponent(id)}`, profile),
+    ),
   getSessionLatestDescendant: (id: string) =>
     fetchJSON<SessionLatestDescendantResponse>(
       `/api/sessions/${encodeURIComponent(id)}/latest-descendant`,
     ),
-  deleteSession: (id: string) =>
-    fetchJSON<{ ok: boolean }>(`/api/sessions/${encodeURIComponent(id)}`, {
+  deleteSession: (id: string, profile = getManagementProfile()) =>
+    fetchJSON<{ ok: boolean }>(
+      appendProfileParam(`/api/sessions/${encodeURIComponent(id)}`, profile),
+      {
+        method: "DELETE",
+      },
+    ),
+  getEmptySessionsCount: (profile = getManagementProfile()) =>
+    fetchJSON<{ count: number }>(
+      appendProfileParam("/api/sessions/empty/count", profile),
+    ),
+  deleteEmptySessions: (profile = getManagementProfile()) =>
+    fetchJSON<{ ok: boolean; deleted: number }>(
+      appendProfileParam("/api/sessions/empty", profile),
+      {
+        method: "DELETE",
+      },
+    ),
+  bulkDeleteSessions: (ids: string[], profile = getManagementProfile()) =>
+    fetchJSON<{ ok: boolean; deleted: number }>("/api/sessions/bulk-delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids, profile: profile || undefined }),
+    }),
+  renameSession: (id: string, title: string, profile = getManagementProfile()) =>
+    fetchJSON<{ ok: boolean; title: string }>(
+      `/api/sessions/${encodeURIComponent(id)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, profile: profile || undefined }),
+      },
+    ),
+  getSessionStats: (profile = getManagementProfile()) =>
+    fetchJSON<SessionStoreStats>(appendProfileParam("/api/sessions/stats", profile)),
+  exportSessionUrl: (id: string, profile = getManagementProfile()) =>
+    appendProfileParam(`/api/sessions/${encodeURIComponent(id)}/export`, profile),
+  pruneSessions: (
+    older_than_days: number,
+    source?: string,
+    profile = getManagementProfile(),
+  ) =>
+    fetchJSON<{ ok: boolean; removed: number }>("/api/sessions/prune", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ older_than_days, source, profile: profile || undefined }),
+    }),
+  listFiles: (path?: string) => {
+    const query = path ? `?path=${encodeURIComponent(path)}` : "";
+    return fetchJSON<ManagedFilesResponse>(`/api/files${query}`);
+  },
+  readFile: (path: string) =>
+    fetchJSON<ManagedFileReadResponse>(
+      `/api/files/read?path=${encodeURIComponent(path)}`,
+    ),
+  uploadFile: (path: string, file: File, overwrite = true) => {
+    // Stream the raw bytes as multipart/form-data. Do NOT set Content-Type —
+    // the browser adds the multipart boundary automatically. Sending the file
+    // as base64 JSON (the old path) inflated the body ~33%, buffered the whole
+    // file in memory, and 502'd on large backup archives behind the proxy
+    // (NS-501).
+    const form = new FormData();
+    form.append("path", path);
+    form.append("overwrite", String(overwrite));
+    form.append("file", file, file.name);
+    return fetchJSON<ManagedFileWriteResponse>("/api/files/upload-stream", {
+      method: "POST",
+      body: form,
+    });
+  },
+  createDirectory: (path: string) =>
+    fetchJSON<ManagedFileWriteResponse>("/api/files/mkdir", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    }),
+  deleteFile: (path: string, recursive = false) =>
+    fetchJSON<{ ok: boolean; path: string }>("/api/files", {
       method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, recursive }),
     }),
   getLogs: (params: { file?: string; lines?: number; level?: string; component?: string }) => {
     const qs = new URLSearchParams();
@@ -246,10 +457,14 @@ export const api = {
     if (params.component && params.component !== "all") qs.set("component", params.component);
     return fetchJSON<LogsResponse>(`/api/logs?${qs.toString()}`);
   },
-  getAnalytics: (days: number) =>
-    fetchJSON<AnalyticsResponse>(`/api/analytics/usage?days=${days}`),
-  getModelsAnalytics: (days: number) =>
-    fetchJSON<ModelsAnalyticsResponse>(`/api/analytics/models?days=${days}`),
+  getAnalytics: (days: number, profile = getManagementProfile()) =>
+    fetchJSON<AnalyticsResponse>(
+      appendProfileParam(`/api/analytics/usage?days=${days}`, profile),
+    ),
+  getModelsAnalytics: (days: number, profile = getManagementProfile()) =>
+    fetchJSON<ModelsAnalyticsResponse>(
+      appendProfileParam(`/api/analytics/models?days=${days}`, profile),
+    ),
   getConfig: () => fetchJSON<Record<string, unknown>>("/api/config"),
   getDefaults: () => fetchJSON<Record<string, unknown>>("/api/config/defaults"),
   getSchema: () => fetchJSON<{ fields: Record<string, unknown>; category_order: string[] }>("/api/config/schema"),
@@ -321,8 +536,36 @@ export const api = {
   // Profiles (minimal)
   getProfiles: () =>
     fetchJSON<{ profiles: ProfileInfo[] }>("/api/profiles"),
-  createProfile: (body: { name: string; clone_from_default: boolean }) =>
-    fetchJSON<{ ok: boolean; name: string; path: string }>("/api/profiles", {
+  getActiveProfile: () =>
+    fetchJSON<ActiveProfileInfo>("/api/profiles/active"),
+  setActiveProfile: (name: string) =>
+    fetchJSON<{ ok: boolean; active: string }>("/api/profiles/active", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    }),
+  createProfile: (body: {
+    name: string;
+    clone_from?: string | null;
+    clone_from_default?: boolean;
+    clone_all?: boolean;
+    no_skills?: boolean;
+    description?: string;
+    provider?: string;
+    model?: string;
+    mcp_servers?: McpServerCreate[];
+    keep_skills?: string[];
+    hub_skills?: string[];
+  }) =>
+    fetchJSON<{
+      ok: boolean;
+      name: string;
+      path: string;
+      model_set?: boolean;
+      mcp_written?: number;
+      skills_disabled?: number;
+      hub_installs?: Array<{ identifier: string; pid: number | null }>;
+    }>("/api/profiles", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -370,8 +613,10 @@ export const api = {
   getToolsets: () => fetchJSON<ToolsetInfo[]>("/api/tools/toolsets"),
 
   // Session search (FTS5)
-  searchSessions: (q: string) =>
-    fetchJSON<SessionSearchResponse>(`/api/sessions/search?q=${encodeURIComponent(q)}`),
+  searchSessions: (q: string, profile = getManagementProfile()) =>
+    fetchJSON<SessionSearchResponse>(
+      appendProfileParam(`/api/sessions/search?q=${encodeURIComponent(q)}`, profile),
+    ),
 
   // OAuth provider management
   getOAuthProviders: () =>
@@ -428,6 +673,54 @@ export const api = {
       },
     );
   },
+
+  // Messaging platforms (gateway channels)
+  getMessagingPlatforms: () =>
+    fetchJSON<MessagingPlatformsResponse>("/api/messaging/platforms"),
+  updateMessagingPlatform: (id: string, body: MessagingPlatformUpdate) =>
+    fetchJSON<{ ok: boolean; platform: string }>(
+      `/api/messaging/platforms/${encodeURIComponent(id)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  testMessagingPlatform: (id: string) =>
+    fetchJSON<MessagingPlatformTestResult>(
+      `/api/messaging/platforms/${encodeURIComponent(id)}/test`,
+      { method: "POST" },
+    ),
+  startTelegramOnboarding: (body: { bot_name?: string }) =>
+    fetchJSON<TelegramOnboardingStartResponse>(
+      "/api/messaging/telegram/onboarding/start",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  getTelegramOnboardingStatus: (pairingId: string) =>
+    fetchJSON<TelegramOnboardingStatusResponse>(
+      `/api/messaging/telegram/onboarding/${encodeURIComponent(pairingId)}`,
+    ),
+  applyTelegramOnboarding: (
+    pairingId: string,
+    body: { allowed_user_ids: string[]; profile?: string },
+  ) =>
+    fetchJSON<TelegramOnboardingApplyResponse>(
+      `/api/messaging/telegram/onboarding/${encodeURIComponent(pairingId)}/apply`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  cancelTelegramOnboarding: (pairingId: string) =>
+    fetchJSON<{ ok: boolean }>(
+      `/api/messaging/telegram/onboarding/${encodeURIComponent(pairingId)}`,
+      { method: "DELETE" },
+    ),
 
   // Gateway / update actions
   restartGateway: () =>
@@ -677,6 +970,36 @@ export interface McpServer {
   tools: string[] | null;
 }
 
+export interface McpCatalogEntry {
+  name: string;
+  description: string;
+  source: string;
+  transport: "http" | "stdio";
+  auth_type: "api_key" | "oauth" | "none";
+  required_env: Array<{ name: string; prompt: string; required: boolean }>;
+  // Transport details — what actually connects (http) or runs (stdio).
+  command: string | null;
+  args: string[];
+  url: string | null;
+  // Git bootstrap (only set for entries that clone + build locally).
+  install_url: string | null;
+  install_ref: string | null;
+  bootstrap: string[];
+  // Default tool pre-selection (null = all tools pre-checked) + guidance text.
+  default_enabled: string[] | null;
+  post_install: string;
+  needs_install: boolean;
+  installed: boolean;
+  enabled: boolean;
+}
+
+export interface McpCatalogDiagnostic {
+  name: string;
+  kind: string;
+  message: string;
+}
+
+
 export interface McpServerCreate {
   name: string;
   url?: string;
@@ -690,6 +1013,57 @@ export interface McpTestResult {
   ok: boolean;
   error?: string;
   tools: Array<{ name: string; description: string }>;
+}
+
+export interface MessagingPlatformEnvVar {
+  key: string;
+  required: boolean;
+  is_set: boolean;
+  redacted_value: string | null;
+  description: string;
+  prompt: string;
+  help: string;
+  url: string | null;
+  is_password: boolean;
+  advanced: boolean;
+}
+
+export interface MessagingPlatform {
+  id: string;
+  name: string;
+  description: string;
+  docs_url: string;
+  enabled: boolean;
+  configured: boolean;
+  gateway_running: boolean;
+  /**
+   * "connected" | "disabled" | "not_configured" | "pending_restart" |
+   * "gateway_stopped" | "startup_failed" | "disconnected" | "fatal" | string
+   */
+  state: string;
+  error_code: string | null;
+  error_message: string | null;
+  updated_at: string | null;
+  home_channel: { platform: string; chat_id: string; name: string; thread_id?: string } | null;
+  env_vars: MessagingPlatformEnvVar[];
+}
+
+export interface MessagingPlatformsResponse {
+  env_path: string;
+  gateway_start_command: string;
+  platforms: MessagingPlatform[];
+}
+
+export interface MessagingPlatformUpdate {
+  enabled?: boolean;
+  env?: Record<string, string>;
+  clear_env?: string[];
+}
+
+export interface MessagingPlatformTestResult {
+  ok: boolean;
+  state: string;
+  message: string;
 }
 
 export interface PairingUser {
@@ -823,6 +1197,9 @@ export interface StatusResponse {
    * Empty in loopback mode; empty + ``auth_required=true`` is a
    * fail-closed state (the dashboard will refuse to bind). */
   auth_providers?: string[];
+  /** False when the dashboard is running in a hosted/managed layout where
+   * updates are handled by the outer launcher instead of ``hermes update``. */
+  can_update_hermes?: boolean;
   config_path: string;
   config_version: number;
   env_path: string;

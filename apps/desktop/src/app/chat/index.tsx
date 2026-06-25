@@ -15,7 +15,9 @@ import { Backdrop } from '@/components/Backdrop'
 import { NotificationStack } from '@/components/notifications'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import { ErrorState } from '@/components/ui/error-state'
 import { getGlobalModelOptions, type HermesGateway } from '@/hermes'
+import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { quickModelOptions, sessionTitle, toRuntimeMessage } from '@/lib/chat-runtime'
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
@@ -35,9 +37,12 @@ import {
   $introPersonality,
   $introSeed,
   $messages,
+  $messagesEmpty,
+  $resumeExhaustedSessionId,
   $selectedStoredSessionId,
   $sessions
 } from '@/store/session'
+import { isSecondaryWindow } from '@/store/windows'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
 import { routeSessionId } from '../routes'
@@ -55,6 +60,7 @@ import { lastVisibleMessageIsUser, threadLoadingState } from './thread-loading'
 
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
+  modelMenuContent?: React.ReactNode
   onToggleSelectedPin: () => void
   onDeleteSelectedSession: () => void
   onCancel: () => Promise<void> | void
@@ -76,7 +82,10 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onThreadMessagesChange: (messages: readonly ThreadMessage[]) => void
   onEdit: (message: AppendMessage) => Promise<void>
   onReload: (parentId: string | null) => Promise<void>
+  onRestoreToMessage?: (messageId: string) => Promise<void>
+  onRetryResume: (sessionId: string) => void
   onTranscribeAudio?: (audio: Blob) => Promise<string>
+  onDismissError?: (messageId: string) => void
 }
 
 interface ChatHeaderProps {
@@ -98,7 +107,22 @@ function ChatHeader({
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const activeStoredSession = sessions.find(session => session.id === selectedSessionId) || null
   const title = activeStoredSession ? sessionTitle(activeStoredSession) : 'New session'
-  const selectedIsPinned = selectedSessionId ? pinnedSessionIds.includes(selectedSessionId) : false
+
+  // Pins live on the durable lineage-root id, but selectedSessionId is the live
+  // (tip) id — resolve through the loaded row so the menu reflects the pin
+  // state after auto-compression rotates the id.
+  const selectedIsPinned = activeStoredSession
+    ? pinnedSessionIds.includes(sessionPinId(activeStoredSession))
+    : selectedSessionId
+      ? pinnedSessionIds.includes(selectedSessionId)
+      : false
+
+  // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
+  // are compact side panels — they drop the session-actions header + border
+  // entirely. A brand-new draft has nothing to pin/delete/rename either.
+  if (isSecondaryWindow() || (!selectedSessionId && !activeSessionId && !isRoutedSessionView)) {
+    return null
+  }
 
   return (
     <header className={cn(titlebarHeaderBaseClass, isRoutedSessionView && titlebarHeaderShadowClass)}>
@@ -126,11 +150,33 @@ function ChatHeader({
   )
 }
 
-export function ChatView({
-  className,
-  gateway,
-  onToggleSelectedPin,
-  onDeleteSelectedSession,
+interface ChatRuntimeBoundaryProps {
+  busy: boolean
+  children: React.ReactNode
+  onCancel: () => Promise<void> | void
+  onEdit: (message: AppendMessage) => Promise<void>
+  onReload: (parentId: string | null) => Promise<void>
+  onThreadMessagesChange: (messages: readonly ThreadMessage[]) => void
+  /** Route points at an unloaded session — render empty until resume swaps in
+   *  the new transcript, so the previous session's messages don't linger. */
+  suppressMessages: boolean
+}
+
+const NO_MESSAGES: ChatMessage[] = []
+
+/**
+ * Owns the $messages subscription and the assistant-ui external-store runtime.
+ *
+ * Isolated from ChatView so the per-token delta flush (which replaces the
+ * $messages atom ~30×/s during streaming) only re-renders this component and
+ * the runtime provider. The children (Thread, ChatBar) are created by
+ * ChatView, whose render output is stable across flushes — so React bails out
+ * of re-rendering them by element identity and the stream's render cost stays
+ * confined to the streaming message's own subtree.
+ */
+function ChatRuntimeBoundary({
+  busy,
+  children,
   onCancel,
   onAddContextRef,
   onAddUrl,
@@ -147,23 +193,11 @@ export function ChatView({
   onThreadMessagesChange,
   onEdit,
   onReload,
-  onTranscribeAudio
-}: ChatViewProps) {
-  const location = useLocation()
-  const activeSessionId = useStore($activeSessionId)
-  const awaitingResponse = useStore($awaitingResponse)
-  const busy = useStore($busy)
-  const contextSuggestions = useStore($contextSuggestions)
-  const currentCwd = useStore($currentCwd)
-  const currentModel = useStore($currentModel)
-  const currentProvider = useStore($currentProvider)
-  const freshDraftReady = useStore($freshDraftReady)
-  const gatewayState = useStore($gatewayState)
-  const gatewayOpen = gatewayState === 'open'
-  const introPersonality = useStore($introPersonality)
-  const introSeed = useStore($introSeed)
-  const messages = useStore($messages)
-  const selectedSessionId = useStore($selectedStoredSessionId)
+  onThreadMessagesChange,
+  suppressMessages
+}: ChatRuntimeBoundaryProps) {
+  const storeMessages = useStore($messages)
+  const messages = suppressMessages ? NO_MESSAGES : storeMessages
   const runtimeMessageCacheRef = useRef(new WeakMap<ChatMessage, ThreadMessage>())
   const isRoutedSessionView = Boolean(routeSessionId(location.pathname))
 
@@ -271,6 +305,141 @@ export function ChatView({
     onReload
   })
 
+  return <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
+}
+
+export function ChatView({
+  className,
+  gateway,
+  modelMenuContent,
+  onToggleSelectedPin,
+  onDeleteSelectedSession,
+  onCancel,
+  onAddContextRef,
+  onAddUrl,
+  onAttachImageBlob,
+  onAttachDroppedItems,
+  onBranchInNewChat,
+  maxVoiceRecordingSeconds,
+  onPasteClipboardImage,
+  onPickFiles,
+  onPickFolders,
+  onPickImages,
+  onRemoveAttachment,
+  onSteer,
+  onSubmit,
+  onThreadMessagesChange,
+  onEdit,
+  onReload,
+  onRestoreToMessage,
+  onRetryResume,
+  onTranscribeAudio,
+  onDismissError
+}: ChatViewProps) {
+  const location = useLocation()
+  const { t } = useI18n()
+  const activeSessionId = useStore($activeSessionId)
+  const awaitingResponse = useStore($awaitingResponse)
+  const busy = useStore($busy)
+  const contextSuggestions = useStore($contextSuggestions)
+  const currentCwd = useStore($currentCwd)
+  const currentModel = useStore($currentModel)
+  const currentProvider = useStore($currentProvider)
+  const freshDraftReady = useStore($freshDraftReady)
+  const gatewayState = useStore($gatewayState)
+  const gatewaySwapTarget = useStore($gatewaySwapTarget)
+  const gatewayOpen = gatewayState === 'open'
+  const introPersonality = useStore($introPersonality)
+  const introSeed = useStore($introSeed)
+  // PERF: ChatView must not subscribe to $messages — the atom is replaced on
+  // every streaming delta flush (~30×/s) and a subscription here re-renders
+  // the entire chat shell (header, chat bar, thread wrapper) per token. The
+  // runtime that DOES need the messages lives in ChatRuntimeBoundary below;
+  // this component only needs streaming-stable derivations.
+  const messagesEmpty = useStore($messagesEmpty)
+  const lastVisibleIsUser = useStore($lastVisibleMessageIsUser)
+  const selectedSessionId = useStore($selectedStoredSessionId)
+  const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
+  const routedSessionId = routeSessionId(location.pathname)
+  const isRoutedSessionView = Boolean(routedSessionId)
+
+  // The URL points at a session the store hasn't loaded yet (sidebar / cmd-K /
+  // direct nav). Derived in render so the swap reads instantly: the same frame
+  // the id changes we drop the old transcript and show the loader, instead of
+  // waiting for the resume effect (which paints a frame later) to clear them.
+  const routeSessionMismatch = isRoutedSessionView && routedSessionId !== selectedSessionId
+
+  // The compact new-session pop-out skips the wordmark/tagline intro — it's a
+  // scratch window, not the full-height empty state.
+  const showIntro =
+    !isSecondaryWindow() && freshDraftReady && !isRoutedSessionView && !selectedSessionId && !activeSessionId && messagesEmpty
+
+  // Session is still loading if the route references a session we haven't
+  // resumed yet. Once `activeSessionId` is set (runtime has resumed), the
+  // session exists — even if it has zero messages (a brand-new routed
+  // session). The flicker where `busy` flips true briefly during hydrate
+  // is handled by `threadLoadingState`'s last-visible-user gate.
+  //
+  // resumeExhausted: the bounded auto-retry in use-route-resume gave up on this
+  // routed session (gateway RPC + REST fallback failed through every attempt).
+  // Suppress the loader and show an explicit error + manual Retry instead of
+  // spinning forever. Gated on the route matching so a stale latch from another
+  // session can't blank the current one.
+  const resumeExhausted = isRoutedSessionView && resumeExhaustedSessionId === routedSessionId
+
+  const loadingSession =
+    !resumeExhausted && isRoutedSessionView && (routeSessionMismatch || (messagesEmpty && !activeSessionId))
+
+  const threadLoading = threadLoadingState(loadingSession, busy, awaitingResponse, lastVisibleIsUser)
+  // Hide the composer in the exhausted error state too: there's no live runtime
+  // to send to until a retry rebinds one.
+  const showChatBar = !loadingSession && !resumeExhausted
+  const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
+
+  const modelOptionsQuery = useQuery<ModelOptionsResponse>({
+    queryKey: ['model-options', activeSessionId || 'global'],
+    queryFn: () => {
+      if (!activeSessionId) {
+        return getGlobalModelOptions()
+      }
+
+      if (!gateway) {
+        throw new Error('Hermes gateway unavailable')
+      }
+
+      return gateway.request<ModelOptionsResponse>('model.options', { session_id: activeSessionId })
+    },
+    enabled: gatewayOpen
+  })
+
+  const quickModels = useMemo(
+    () => quickModelOptions(modelOptionsQuery.data, currentProvider, currentModel),
+    [currentModel, currentProvider, modelOptionsQuery.data]
+  )
+
+  const chatBarState = useMemo<ChatBarState>(
+    () => ({
+      model: {
+        model: currentModel,
+        provider: currentProvider,
+        canSwitch: gatewayOpen,
+        loading: !gatewayOpen || (!currentModel && !currentProvider),
+        modelMenuContent,
+        quickModels
+      },
+      tools: {
+        enabled: true,
+        label: 'Add context',
+        suggestions: contextSuggestions
+      },
+      voice: {
+        enabled: true,
+        active: false
+      }
+    }),
+    [contextSuggestions, currentModel, currentProvider, gatewayOpen, modelMenuContent, quickModels]
+  )
+
   // Drop files anywhere in the conversation area, not just on the composer
   // input — appending the same inline `@file:` ref chips the composer drop
   // produces (vs. attachment cards) so both surfaces behave identically.
@@ -307,11 +476,19 @@ export function ChatView({
 
       <NotificationStack />
 
-      <div
-        className="relative min-h-0 max-w-full flex-1 overflow-hidden bg-(--ui-chat-surface-background) contain-[layout_paint]"
-        {...dropHandlers}
+      <ChatRuntimeBoundary
+        busy={busy}
+        onCancel={onCancel}
+        onEdit={onEdit}
+        onReload={onReload}
+        onThreadMessagesChange={onThreadMessagesChange}
+        suppressMessages={routeSessionMismatch}
       >
-        <AssistantRuntimeProvider runtime={runtime}>
+        <div
+          className="relative min-h-0 max-w-full flex-1 overflow-hidden bg-(--ui-chat-surface-background) contain-[layout_paint]"
+          data-slot="composer-bounds"
+          {...dropHandlers}
+        >
           <Thread
             clampToComposer={showChatBar}
             cwd={currentCwd}
@@ -320,39 +497,67 @@ export function ChatView({
             loading={threadLoading}
             onBranchInNewChat={onBranchInNewChat}
             onCancel={onCancel}
+            onDismissError={onDismissError}
+            onRestoreToMessage={onRestoreToMessage}
             sessionId={activeSessionId}
             sessionKey={threadKey}
           />
-          {showChatBar && (
-            <Suspense fallback={<ChatBarFallback />}>
-              <ChatBar
-                busy={busy}
-                cwd={currentCwd}
-                disabled={!gatewayOpen}
-                focusKey={activeSessionId}
-                gateway={gateway}
-                maxRecordingSeconds={maxVoiceRecordingSeconds}
-                onAddContextRef={onAddContextRef}
-                onAddUrl={onAddUrl}
-                onAttachDroppedItems={onAttachDroppedItems}
-                onAttachImageBlob={onAttachImageBlob}
-                onCancel={onCancel}
-                onPasteClipboardImage={onPasteClipboardImage}
-                onPickFiles={onPickFiles}
-                onPickFolders={onPickFolders}
-                onPickImages={onPickImages}
-                onRemoveAttachment={onRemoveAttachment}
-                onSubmit={onSubmit}
-                onTranscribeAudio={onTranscribeAudio}
-                queueSessionKey={selectedSessionId || activeSessionId}
-                sessionId={activeSessionId}
-                state={chatBarState}
-              />
-            </Suspense>
+          {resumeExhausted && routedSessionId && (
+            <div className="absolute inset-0 z-10 grid place-items-center bg-(--ui-chat-surface-background) px-8 py-10">
+              <ErrorState
+                className="max-w-sm"
+                description={t.desktop.resumeStrandedBody}
+                title={t.desktop.resumeStrandedTitle}
+              >
+                <div className="grid justify-items-center">
+                  <Button onClick={() => onRetryResume(routedSessionId)} size="sm" variant="outline">
+                    {t.desktop.resumeRetry}
+                  </Button>
+                </div>
+              </ErrorState>
+            </div>
           )}
-        </AssistantRuntimeProvider>
-        <ChatDropOverlay active={dragActive} />
-      </div>
+          {showChatBar && <ScrollToBottomButton />}
+          <ChatDropOverlay kind={dragKind} />
+          <ChatSwapOverlay profile={gatewaySwapTarget} />
+        </div>
+        {/* Composer renders OUTSIDE the contain:[layout paint] wrapper above:
+            that wrapper is a containing block for — and clips — position:fixed
+            descendants, so the popped-out (fixed) composer would anchor to the
+            chat column (which shifts/resizes with the sidebars) and get clipped
+            off-screen instead of floating against the viewport. As a sibling it
+            anchors to the outer relative container instead: docked is absolute
+            (identical placement), floating resolves against the viewport. Both
+            states stay mounted here, so dock⇄float never remounts the editor. */}
+        {showChatBar && (
+          <Suspense fallback={<ChatBarFallback />}>
+            <ChatBar
+              busy={busy}
+              cwd={currentCwd}
+              disabled={!gatewayOpen}
+              focusKey={activeSessionId}
+              gateway={gateway}
+              maxRecordingSeconds={maxVoiceRecordingSeconds}
+              onAddContextRef={onAddContextRef}
+              onAddUrl={onAddUrl}
+              onAttachDroppedItems={onAttachDroppedItems}
+              onAttachImageBlob={onAttachImageBlob}
+              onCancel={onCancel}
+              onPasteClipboardImage={onPasteClipboardImage}
+              onPickFiles={onPickFiles}
+              onPickFolders={onPickFolders}
+              onPickImages={onPickImages}
+              onRemoveAttachment={onRemoveAttachment}
+              onSteer={onSteer}
+              onSubmit={onSubmit}
+              onTranscribeAudio={onTranscribeAudio}
+              queueSessionKey={selectedSessionId}
+              sessionId={activeSessionId}
+              state={chatBarState}
+            />
+          </Suspense>
+        )}
+      </ChatRuntimeBoundary>
     </div>
   )
 }

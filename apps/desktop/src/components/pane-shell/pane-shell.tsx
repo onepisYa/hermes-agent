@@ -14,7 +14,7 @@ import {
 } from 'react'
 
 import { cn } from '@/lib/utils'
-import { $paneStates, ensurePaneRegistered, setPaneWidthOverride } from '@/store/panes'
+import { $paneHoverRevealSuppressed, $paneStates, ensurePaneRegistered, setPaneWidthOverride } from '@/store/panes'
 
 import { PaneShellContext, type PaneShellContextValue, type PaneSlot } from './context'
 
@@ -61,6 +61,25 @@ interface CollectedPane {
 
 const DEFAULT_WIDTH = '16rem'
 const DEFAULT_RESIZE_MIN_WIDTH = 160
+
+// Hover-reveal slide. The enter delay is a pure-CSS hover-intent gate: a fast
+// pass-by doesn't dwell on the trigger long enough for the delay to elapse.
+const HOVER_REVEAL_SLIDE_MS = 220
+const HOVER_REVEAL_ENTER_DELAY_MS = 130
+const HOVER_REVEAL_EASE = 'cubic-bezier(0.32,0.72,0,1)'
+// Offset shadow lifting the revealed panel off the content (same both sides;
+// the mirror axis is offset-x, which is 0). Same color on light + dark.
+const HOVER_REVEAL_SHADOW = '0px -18px 18px -5px #00000012'
+// Edge trigger strip, inset past the OS window-resize grab area AND the
+// adjacent pane's scrollbar (0.5rem, .scrollbar-dt) — the strip overlays the
+// neighboring scroller's edge, so any overlap makes the scrollbar reveal the
+// pane on hover and swallow its clicks (#44140).
+const HOVER_REVEAL_TRIGGER_WIDTH = 14
+const HOVER_REVEAL_EDGE_GUTTER = 'calc(0.5rem + 2px)'
+
+// Fired (window CustomEvent<{ id }>) to toggle a force-collapsed pane's reveal
+// from the keyboard, since its store-open toggle is a no-op while collapsed.
+export const PANE_TOGGLE_REVEAL_EVENT = 'hermes:pane-toggle-reveal'
 
 const widthToCss = (value: WidthValue | undefined, fallback: string) =>
   value === undefined ? fallback : typeof value === 'number' ? `${value}px` : value
@@ -199,6 +218,8 @@ export function Pane({
   resizable = false
 }: PaneProps) {
   const ctx = useContext(PaneShellContext)
+  const paneStates = useStore($paneStates)
+  const hoverRevealSuppressed = useStore($paneHoverRevealSuppressed)
   const registered = useRef(false)
   const paneRef = useRef<HTMLDivElement | null>(null)
 
@@ -271,6 +292,62 @@ export function Pane({
 
   if (!slot) {
     return null
+  }
+
+  // Collapsed hover-reveal track: a 0px, pointer-transparent grid cell holding a
+  // thin edge trigger + the floating panel (both absolute, escaping the zero
+  // box). group-hover (or data-forced from the keyboard) drives the slide; the
+  // enter-delay is the hover-intent gate. No JS pointer math.
+  if (overlayActive) {
+    const edge = side === 'left' ? 'left' : 'right'
+    const offscreen = side === 'left' ? '-translate-x-[calc(100%+1rem)]' : 'translate-x-[calc(100%+1rem)]'
+
+    return (
+      <div
+        className={cn('group/reveal pointer-events-none relative row-start-1 min-w-0', className)}
+        data-forced={forced ? '' : undefined}
+        data-pane-hover-reveal={forced ? 'open' : 'closed'}
+        data-pane-id={id}
+        data-pane-open="false"
+        data-pane-side={side}
+        ref={paneRef}
+        style={{ gridColumn: `${slot.column} / ${slot.column + 1}` }}
+      >
+        <div
+          aria-hidden="true"
+          className={cn(
+            'absolute inset-y-0 z-30 [-webkit-app-region:no-drag]',
+            hoverRevealSuppressed ? 'pointer-events-none' : 'pointer-events-auto'
+          )}
+          style={{ [edge]: HOVER_REVEAL_EDGE_GUTTER, width: HOVER_REVEAL_TRIGGER_WIDTH }}
+        />
+
+        {/* Keyed on side so flipping panes remounts off-screen on the new edge
+            instead of transitioning the transform across the viewport. */}
+        <div
+          className={cn(
+            'pointer-events-none absolute inset-y-0 z-30 overflow-hidden transition-transform delay-0',
+            offscreen,
+            !hoverRevealSuppressed &&
+              'group-hover/reveal:pointer-events-auto group-hover/reveal:translate-x-0 group-hover/reveal:delay-[var(--reveal-enter-delay)] group-hover/reveal:shadow-[var(--reveal-shadow)]',
+            'group-data-[forced]/reveal:pointer-events-auto group-data-[forced]/reveal:translate-x-0 group-data-[forced]/reveal:delay-0 group-data-[forced]/reveal:shadow-[var(--reveal-shadow)]'
+          )}
+          key={edge}
+          style={
+            {
+              [edge]: 0,
+              width: overlayWidth,
+              '--reveal-shadow': HOVER_REVEAL_SHADOW,
+              transitionDuration: `${HOVER_REVEAL_SLIDE_MS}ms`,
+              transitionTimingFunction: HOVER_REVEAL_EASE,
+              '--reveal-enter-delay': `${HOVER_REVEAL_ENTER_DELAY_MS}ms`
+            } as CSSProperties
+          }
+        >
+          <div className="flex h-full w-full flex-col">{children}</div>
+        </div>
+      </div>
+    )
   }
 
   return (

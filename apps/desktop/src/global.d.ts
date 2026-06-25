@@ -1,9 +1,52 @@
+import type {
+  PetOverlayBounds,
+  PetOverlayControl,
+  PetOverlayOpenRequest,
+  PetOverlayStatePayload
+} from './store/pet-overlay'
+
 export {}
 
 declare global {
   interface Window {
     hermesDesktop: {
-      getConnection: () => Promise<HermesConnection>
+      // Resolve a backend connection. Omit `profile` (or pass the primary) for
+      // the window's backend; pass a named profile to lazily spawn/reuse that
+      // profile's backend from the pool.
+      getConnection: (profile?: string | null) => Promise<HermesConnection>
+      // Reconnect-after-wake recovery: liveness-probe the cached PRIMARY backend
+      // and drop it if a remote one has gone unreachable, so the next
+      // getConnection() rebuilds a reachable descriptor instead of the renderer
+      // re-dialing a dead remote forever. No-op for local backends (they
+      // self-heal via the child 'exit' handler). `rebuilt` is true when a stale
+      // remote cache was dropped.
+      revalidateConnection: () => Promise<{ ok: boolean; rebuilt: boolean }>
+      // Keepalive: mark a pool profile backend as recently used so the idle
+      // reaper spares it while its chat is active.
+      touchBackend: (profile?: string | null) => Promise<{ ok: boolean }>
+      getGatewayWsUrl: (profile?: null | string) => Promise<string>
+      // Open (or focus) a standalone OS window for a single chat session so
+      // the user can work with multiple chats side by side. Returns ok:false
+      // with an error code when the sessionId is empty/invalid. `watch` opens
+      // a spectator window (lazy resume — no agent build) for live-streaming
+      // a running subagent's session.
+      openSessionWindow: (sessionId: string, opts?: { watch?: boolean }) => Promise<{ ok: boolean; error?: string }>
+      // Open (or focus) a compact secondary window on the new-session draft.
+      openNewSessionWindow: () => Promise<{ ok: boolean; error?: string }>
+      // The pop-out pet overlay: a transparent always-on-top window hosting only
+      // the mascot. The main renderer drives it (open/close/drag + state push);
+      // the overlay sends control messages back (pop-in, composer submit).
+      petOverlay: {
+        open: (request: PetOverlayOpenRequest) => Promise<{ ok: boolean; bounds?: PetOverlayBounds }>
+        close: () => Promise<{ ok: boolean }>
+        setBounds: (bounds: PetOverlayBounds) => void
+        setIgnoreMouse: (ignore: boolean) => void
+        setFocusable: (focusable: boolean) => void
+        pushState: (payload: PetOverlayStatePayload) => void
+        control: (payload: PetOverlayControl) => void
+        onState: (callback: (payload: PetOverlayStatePayload) => void) => () => void
+        onControl: (callback: (payload: PetOverlayControl) => void) => () => void
+      }
       getBootProgress: () => Promise<DesktopBootProgress>
       getConnectionConfig: () => Promise<DesktopConnectionConfig>
       saveConnectionConfig: (payload: DesktopConnectionConfigInput) => Promise<DesktopConnectionConfig>
@@ -26,6 +69,7 @@ declare global {
       setTitleBarTheme?: (payload: HermesTitleBarTheme) => void
       setPreviewShortcutActive?: (active: boolean) => void
       openExternal: (url: string) => Promise<void>
+      openPreviewInBrowser?: (url: string) => Promise<void>
       fetchLinkTitle: (url: string) => Promise<string>
       revealLogs: () => Promise<{ ok: boolean; path: string; error?: string }>
       getRecentLogs: () => Promise<{ path: string; lines: string[] }>
@@ -42,6 +86,8 @@ declare global {
       onClosePreviewRequested?: (callback: () => void) => () => void
       onOpenUpdatesRequested?: (callback: () => void) => () => void
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
+      onFocusSession?: (callback: (sessionId: string) => void) => () => void
+      onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void
       onPreviewFileChanged: (callback: (payload: HermesPreviewFileChanged) => void) => () => void
       onBackendExit: (callback: (payload: BackendExit) => void) => () => void
       onBootProgress: (callback: (payload: DesktopBootProgress) => void) => () => void
@@ -50,6 +96,7 @@ declare global {
       repairBootstrap: () => Promise<{ ok: boolean }>
       onBootstrapEvent: (callback: (payload: DesktopBootstrapEvent) => void) => () => void
       getVersion: () => Promise<DesktopVersionInfo>
+      getRemoteDisplayReason?: () => Promise<string | null>
       updates: {
         check: () => Promise<DesktopUpdateStatus>
         apply: (opts?: DesktopUpdateApplyOptions) => Promise<DesktopUpdateApplyResult>
@@ -118,9 +165,45 @@ export interface DesktopUpdateApplyResult {
   manual?: boolean
   command?: string
   hermesRoot?: string
+  /** True when the backend was updated but the GUI couldn't be relaunched in
+   *  place (AppImage / dev run): the new version loads on next launch. */
+  backendUpdated?: boolean
+  /** False when the running GUI package was NOT replaced by this update
+   *  (Linux GUI/backend skew, or a sandbox-blocked relaunch). Distinguishes
+   *  "backend only" outcomes from a real in-place GUI relaunch. (#45205) */
+  guiUpdated?: boolean
+  /** True for the Linux GUI/backend-skew terminal state: backend updated but
+   *  the running AppImage/.deb/.rpm shell is unchanged and must be
+   *  reinstalled. Renders a closeable "update the desktop app" message. */
+  guiSkew?: boolean
+  /** True when the update finished but the app must be quit + reopened by hand
+   *  (e.g. the rebuilt sandbox helper isn't launchable): keep a working
+   *  window, don't auto-quit into a dead app. (#45205) */
+  manualRestart?: boolean
+  /** True when the auto-relaunch was skipped specifically because the rebuilt
+   *  chrome-sandbox helper is not launchable (not root:root + setuid). */
+  sandboxBlocked?: boolean
+  /** True when a detached relauncher took over (macOS bundle swap / Linux
+   *  re-exec): the app is about to quit and reopen itself. */
+  handedOff?: boolean
 }
 
-export type DesktopUpdateStage = 'idle' | 'prepare' | 'fetch' | 'pull' | 'pydeps' | 'restart' | 'manual' | 'error'
+export type DesktopUpdateStage =
+  | 'idle'
+  | 'prepare'
+  | 'fetch'
+  | 'pull'
+  | 'pydeps'
+  | 'update'
+  | 'rebuild'
+  | 'restart'
+  | 'done'
+  | 'manual'
+  /** Backend updated but the running GUI package (AppImage/.deb/.rpm) was NOT
+   *  changed — the user must update/reinstall the desktop app. Terminal,
+   *  closeable; never claims the GUI was updated. (#45205) */
+  | 'guiSkew'
+  | 'error'
 
 export interface DesktopUpdateProgress {
   stage: DesktopUpdateStage
@@ -260,6 +343,9 @@ export interface HermesNotification {
   title?: string
   body?: string
   silent?: boolean
+  kind?: string
+  sessionId?: string
+  actions?: { id: string; text: string }[]
 }
 
 export interface HermesPreviewTarget {

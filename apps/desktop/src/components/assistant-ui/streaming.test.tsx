@@ -58,9 +58,9 @@ Element.prototype.animate = function animate() {
   } as unknown as Animation
 }
 
-// jsdom returns 0 for offset*; the virtualizer reads those to size its
+// jsdom returns 0 for offset*; some layout code reads those to size the
 // viewport. Fall through to client* (which tests can override) or a sane
-// default so virtualized items render.
+// default so message rows render with non-zero dimensions.
 function stubOffsetDimension(
   prop: 'offsetHeight' | 'offsetWidth',
   clientProp: 'clientHeight' | 'clientWidth',
@@ -195,25 +195,21 @@ function assistantTodoMessage(
   } as ThreadMessage
 }
 
-function assistantReasoningTodoMessage(
-  todos: Array<{ content: string; id: string; status: 'cancelled' | 'completed' | 'in_progress' | 'pending' }>
-): ThreadMessage {
+function assistantImageMessage(running = false): ThreadMessage {
   return {
-    id: 'assistant-reasoning-todo-1',
+    id: `assistant-image-${running ? 'running' : 'done'}`,
     role: 'assistant',
     content: [
-      { type: 'reasoning', text: 'Let me make a quick todo list.' },
       {
         type: 'tool-call',
-        toolCallId: 'todo-1',
-        toolName: 'todo',
-        args: { todos },
-        argsText: JSON.stringify({ todos }),
-        result: { todos }
-      },
-      { type: 'text', text: 'Done — fake list created.' }
+        toolCallId: 'image-1',
+        toolName: 'image_generate',
+        args: { prompt: 'draw a cat' },
+        argsText: JSON.stringify({ prompt: 'draw a cat' }),
+        ...(running ? {} : { result: { image: 'https://cdn.example/cat.png', success: true } })
+      }
     ],
-    status: { type: 'complete', reason: 'stop' },
+    status: running ? { type: 'running' } : { type: 'complete', reason: 'stop' },
     createdAt,
     metadata: {
       unstable_state: null,
@@ -333,6 +329,20 @@ function IntroHarness() {
   )
 }
 
+function DismissibleErrorHarness({ onDismissError }: { onDismissError: (messageId: string) => void }) {
+  const runtime = useExternalStoreRuntime<ThreadMessage>({
+    messages: [assistantErrorMessage('OpenRouter rejected the request (403).')],
+    isRunning: false,
+    onNew: async () => {}
+  })
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <Thread onDismissError={onDismissError} />
+    </AssistantRuntimeProvider>
+  )
+}
+
 describe('assistant-ui streaming renderer', () => {
   beforeEach(() => {
     resizeObservers.clear()
@@ -376,43 +386,57 @@ describe('assistant-ui streaming renderer', () => {
     expect(screen.getByRole('alert').textContent).toContain('OpenRouter rejected the request (403).')
   })
 
-  it('does not pull the viewport back down after the user scrolls up during streaming', async () => {
-    const { container } = render(<StreamingHarness />)
+  it('omits the dismiss control when no onDismissError handler is supplied', () => {
+    render(<MessageHarness message={assistantErrorMessage('OpenRouter rejected the request (403).')} />)
 
-    const content = container.querySelector('[data-slot="aui_thread-content"]') as HTMLDivElement
-    const viewport = content.parentElement as HTMLDivElement
-    let scrollHeight = 1_000
+    expect(screen.queryByRole('button', { name: 'Dismiss error' })).toBeNull()
+  })
 
-    Object.defineProperty(viewport, 'clientHeight', { configurable: true, value: 200 })
-    Object.defineProperty(viewport, 'scrollHeight', {
-      configurable: true,
-      get: () => scrollHeight
+  it('invokes onDismissError with the errored message id when the dismiss control is clicked', () => {
+    const onDismissError = vi.fn()
+    render(<DismissibleErrorHarness onDismissError={onDismissError} />)
+
+    const dismiss = screen.getByRole('button', { name: 'Dismiss error' })
+    fireEvent.click(dismiss)
+
+    expect(onDismissError).toHaveBeenCalledTimes(1)
+    expect(onDismissError).toHaveBeenCalledWith('assistant-error-1')
+  })
+
+  // Scroll behavior (follow-at-bottom, escape-on-scroll-up, re-engage) is owned
+  // by the use-stick-to-bottom library and covered by its own test suite. We
+  // don't re-assert its scrollTop mechanics here — doing so in jsdom (no real
+  // layout, spring animation via rAF) only produces brittle change-detector
+  // tests. The rendering/streaming-content tests below remain the contract.
+
+  it('renders an incomplete streaming fenced code block as a code card', async () => {
+    const { container } = render(<RunningMessageHarness message={assistantMessage('```ts\nconst answer = 42\n')} />)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-slot="code-card"]')).toBeTruthy()
     })
 
-    await wait(80)
+    expect(container.textContent).toContain('const answer = 42')
+    expect(container.textContent).not.toContain('```ts')
+  })
 
-    await act(async () => {
-      viewport.scrollTop = 800
-      fireEvent.scroll(viewport)
+  it('renders an incomplete streaming reasoning fenced code block as a code card', async () => {
+    const { container } = render(<RunningReasoningHarness />)
+    const ui = within(container)
+    const thinkingToggle = ui.getByRole('button', { name: /thinking/i })
+
+    if (thinkingToggle.getAttribute('aria-expanded') !== 'true') {
+      fireEvent.click(thinkingToggle)
+    }
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-slot="code-card"]')).toBeTruthy()
     })
-    await wait(0)
 
-    await act(async () => {
-      fireEvent.wheel(viewport, { deltaY: -120 })
-      viewport.scrollTop = 420
-      fireEvent.scroll(viewport)
+    await waitFor(() => {
+      expect(container.querySelector('[data-slot="aui_reasoning-text"]')?.textContent).toContain('const answer = 42')
     })
-
-    scrollHeight = 1_200
-
-    await act(async () => {
-      for (const observer of resizeObservers) {
-        observer.trigger(1_200)
-      }
-    })
-    await wait(0)
-
-    expect(viewport.scrollTop).toBe(420)
+    expect(container.textContent).not.toContain('```ts')
   })
 
   it('renders reasoning text without a leading token space', () => {
@@ -496,5 +520,17 @@ describe('assistant-ui streaming renderer', () => {
     expect(todoPanel).toBeTruthy()
     expect(thinkingDisclosure).toBeTruthy()
     expect(Boolean(thinkingDisclosure?.contains(todoPanel as Node))).toBe(false)
+  })
+
+  it('renders completed image generation results in the tool slot', async () => {
+    const { container } = render(<MessageHarness message={assistantImageMessage()} />)
+
+    await waitFor(() => {
+      expect(screen.getByRole('img', { name: 'Generated image' }).getAttribute('src')).toBe(
+        'https://cdn.example/cat.png'
+      )
+    })
+    expect(container.querySelector('[data-slot="aui_generated-image"]')).toBeTruthy()
+    expect(screen.queryByRole('status', { name: /rendering image/i })).toBeNull()
   })
 })

@@ -168,3 +168,102 @@ def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project; rm -rf /")
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project$(whoami)")
     assert terminal_tool._validate_workdir("C:\\Users\\Alice\\project\nwhoami")
+
+
+def test_get_env_config_ignores_bad_docker_json_for_local_backend(monkeypatch):
+    """Docker-only JSON env vars must not break the default local backend."""
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", "None")
+    monkeypatch.setenv("TERMINAL_DOCKER_ENV", "not-json")
+    monkeypatch.setenv("TERMINAL_DOCKER_FORWARD_ENV", "not-json")
+    monkeypatch.setenv("TERMINAL_DOCKER_EXTRA_ARGS", "not-json")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["env_type"] == "local"
+    assert config["docker_volumes"] == []
+    assert config["docker_env"] == {}
+    assert config["docker_forward_env"] == []
+    assert config["docker_extra_args"] == []
+
+
+def test_get_env_config_ignores_bad_docker_json_for_ssh_backend(monkeypatch):
+    """Non-container remote backends should also ignore Docker-only JSON."""
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", "None")
+    monkeypatch.setenv("TERMINAL_DOCKER_ENV", "not-json")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["env_type"] == "ssh"
+    assert config["docker_volumes"] == []
+    assert config["docker_env"] == {}
+
+
+def test_get_env_config_still_rejects_bad_docker_json_for_docker_backend(monkeypatch):
+    """Selecting Docker should keep the existing actionable config error."""
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", "None")
+
+    try:
+        terminal_tool._get_env_config()
+    except ValueError as exc:
+        assert "TERMINAL_DOCKER_VOLUMES" in str(exc)
+    else:
+        raise AssertionError("Docker backend must validate TERMINAL_DOCKER_VOLUMES")
+
+
+def test_sudo_wrong_password_failure_detects_rejection_output():
+    output = (
+        "sudo: Authentication failed, try again.\n\n"
+        "sudo: maximum 3 incorrect authentication attempts\n"
+    )
+    assert terminal_tool._sudo_wrong_password_failure(output) is True
+
+
+def test_sudo_wrong_password_failure_ignores_tty_required_message():
+    output = "sudo: a terminal is required to authenticate"
+    assert terminal_tool._sudo_wrong_password_failure(output) is False
+
+
+def test_invalidate_cached_sudo_on_auth_failure_clears_session_cache(monkeypatch):
+    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+    terminal_tool._set_cached_sudo_password("wrong-pass")
+
+    cleared = terminal_tool._invalidate_cached_sudo_on_auth_failure(
+        "sudo apt install fprintd",
+        "sudo: Authentication failed, try again.",
+    )
+
+    assert cleared is True
+    assert terminal_tool._get_cached_sudo_password() == ""
+
+
+def test_invalidate_cached_sudo_on_auth_failure_keeps_env_password(monkeypatch):
+    monkeypatch.setenv("SUDO_PASSWORD", "from-env")
+    terminal_tool._set_cached_sudo_password("wrong-pass")
+
+    cleared = terminal_tool._invalidate_cached_sudo_on_auth_failure(
+        "sudo true",
+        "sudo: Authentication failed, try again.",
+    )
+
+    assert cleared is False
+    assert terminal_tool._get_cached_sudo_password() == "wrong-pass"
+
+
+def test_transform_sudo_command_pipes_one_password_line_per_invocation(monkeypatch):
+    monkeypatch.setenv("SUDO_PASSWORD", "testpass")
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+
+    transformed, sudo_stdin = terminal_tool._transform_sudo_command(
+        "sudo true && sudo whoami"
+    )
+
+    assert transformed == "sudo -S -p '' true && sudo -S -p '' whoami"
+    assert sudo_stdin == "testpass\ntestpass\n"
+
+
+def test_count_real_sudo_invocations_ignores_mentions(monkeypatch):
+    assert terminal_tool._count_real_sudo_invocations("grep sudo README.md") == 0
+    assert terminal_tool._count_real_sudo_invocations("sudo a; sudo b") == 2

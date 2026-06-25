@@ -62,7 +62,7 @@ export function useGatewayRequest() {
   }, [])
 
   const requestGateway = useCallback(
-    async <T>(method: string, params: Record<string, unknown> = {}) => {
+    async <T>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number, signal?: AbortSignal) => {
       const gateway = gatewayRef.current
 
       if (!gateway) {
@@ -70,7 +70,7 @@ export function useGatewayRequest() {
       }
 
       try {
-        return await gateway.request<T>(method, params)
+        return await gateway.request<T>(method, params, timeoutMs, signal)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
 
@@ -84,7 +84,7 @@ export function useGatewayRequest() {
           throw error
         }
 
-        return recovered.request<T>(method, params)
+        return recovered.request<T>(method, params, timeoutMs, signal)
       }
     },
     [ensureGatewayOpen]

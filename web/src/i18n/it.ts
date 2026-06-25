@@ -142,6 +142,7 @@ export const it: Translations = {
     sessionDeleted: "Sessione eliminata",
     failedToDelete: "Eliminazione della sessione non riuscita",
     resumeInChat: "Riprendi nella chat",
+    newChat: "Nuova chat",
     previousPage: "Pagina precedente",
     nextPage: "Pagina successiva",
     roles: {
@@ -235,8 +236,8 @@ export const it: Translations = {
     nameRequired: "Il nome è obbligatorio",
     nameRule:
       "Solo lettere minuscole, cifre, _ e -; deve iniziare con una lettera o cifra; fino a 64 caratteri.",
-    invalidName: "Nome del profilo non valido",
-    cloneFromDefault: "Clona la configurazione dal profilo predefinito",
+    invalidName: "Nome del profilo non valido",    cloneFrom: "Clona configurazione dal profilo",
+    cloneFromNone: "Nessuno (vuoto)",
     allProfiles: "Profili",
     noProfiles: "Nessun profilo trovato.",
     defaultBadge: "predefinito",

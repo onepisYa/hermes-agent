@@ -191,10 +191,10 @@ _PRIVACY_NOTICE = """\
 ⚠️  This will upload the following to a public paste service:
   • System info (OS, Python version, Hermes version, provider, which API keys
     are configured — NOT the actual keys)
-  • Recent log lines (agent.log, errors.log, gateway.log — may contain
-    conversation fragments and file paths)
-  • Full agent.log and gateway.log (up to 512 KB each — likely contains
-    conversation content, tool outputs, and file paths)
+  • Recent log lines (agent.log, errors.log, gateway.log, gui.log, desktop.log
+    — may contain conversation fragments and file paths)
+  • Full agent.log, gateway.log, gui.log, and desktop.log (up to 512 KB each —
+    likely contains conversation content, tool outputs, and file paths)
 
 Pastes auto-delete after 6 hours.
 """
@@ -503,6 +503,12 @@ def _capture_default_log_snapshots(
         "gateway": _capture_log_snapshot(
             "gateway", tail_lines=errors_lines, redact=redact
         ),
+        "gui": _capture_log_snapshot(
+            "gui", tail_lines=errors_lines, redact=redact
+        ),
+        "desktop": _capture_log_snapshot(
+            "desktop", tail_lines=errors_lines, redact=redact
+        ),
     }
 
 
@@ -569,6 +575,14 @@ def collect_debug_report(
 
     buf.write(f"--- gateway.log (last {errors_lines} lines) ---\n")
     buf.write(log_snapshots["gateway"].tail_text)
+    buf.write("\n\n")
+
+    buf.write(f"--- gui.log (last {errors_lines} lines) ---\n")
+    buf.write(log_snapshots["gui"].tail_text)
+    buf.write("\n\n")
+
+    buf.write(f"--- desktop.log (last {errors_lines} lines) ---\n")
+    buf.write(log_snapshots["desktop"].tail_text)
     buf.write("\n")
 
     return buf.getvalue()
@@ -611,12 +625,18 @@ def run_debug_share(args):
     )
     agent_log = log_snapshots["agent"].full_text
     gateway_log = log_snapshots["gateway"].full_text
+    gui_log = log_snapshots["gui"].full_text
+    desktop_log = log_snapshots["desktop"].full_text
 
     # Prepend dump header to each full log so every paste is self-contained.
     if agent_log:
         agent_log = dump_text + "\n\n--- full agent.log ---\n" + agent_log
     if gateway_log:
         gateway_log = dump_text + "\n\n--- full gateway.log ---\n" + gateway_log
+    if gui_log:
+        gui_log = dump_text + "\n\n--- full gui.log ---\n" + gui_log
+    if desktop_log:
+        desktop_log = dump_text + "\n\n--- full desktop.log ---\n" + desktop_log
 
     # Visible banner so reviewers reading the public paste know redaction
     # was applied at upload time. Banner is omitted under --no-redact.
@@ -626,6 +646,10 @@ def run_debug_share(args):
             agent_log = _REDACTION_BANNER + agent_log
         if gateway_log:
             gateway_log = _REDACTION_BANNER + gateway_log
+        if gui_log:
+            gui_log = _REDACTION_BANNER + gui_log
+        if desktop_log:
+            desktop_log = _REDACTION_BANNER + desktop_log
 
     if local_only:
         print(report)
@@ -645,7 +669,94 @@ def run_debug_share(args):
     urls: dict[str, str] = {}
     failures: list[str] = []
 
-    # 1. Summary report (required)
+    # 1. Summary report (required — raises on failure so callers can fall back)
+    urls["Report"] = upload_to_pastebin(report, expiry_days=expiry)
+
+    # 2-4. Full logs (optional — failures are collected, not raised)
+    for label, content in (
+        ("agent.log", agent_log),
+        ("gateway.log", gateway_log),
+        ("gui.log", gui_log),
+        ("desktop.log", desktop_log),
+    ):
+        if not content:
+            continue
+        try:
+            urls[label] = upload_to_pastebin(content, expiry_days=expiry)
+        except Exception as exc:
+            failures.append(f"{label}: {exc}")
+
+    # Schedule auto-deletion after 6 hours.
+    _schedule_auto_delete(list(urls.values()))
+
+    return DebugShareResult(
+        urls=urls,
+        failures=failures,
+        redacted=redact,
+        auto_delete_seconds=_AUTO_DELETE_SECONDS,
+        report=report,
+    )
+
+
+def run_debug_share(args):
+    """Collect debug report + full logs, upload each, print URLs."""
+    log_lines = getattr(args, "lines", 200)
+    expiry = getattr(args, "expire", 7)
+    local_only = getattr(args, "local", False)
+    redact = not getattr(args, "no_redact", False)
+
+    if local_only:
+        # Local-only path never uploads — render the report to stdout and bail
+        # before any network I/O. Mirrors the upload path's collection logic.
+        _best_effort_sweep_expired_pastes()
+        print("Collecting debug report...")
+        dump_text = _capture_dump()
+        log_snapshots = _capture_default_log_snapshots(log_lines, redact=redact)
+        report = collect_debug_report(
+            log_lines=log_lines,
+            dump_text=dump_text,
+            log_snapshots=log_snapshots,
+        )
+        agent_log = log_snapshots["agent"].full_text
+        gateway_log = log_snapshots["gateway"].full_text
+        gui_log = log_snapshots["gui"].full_text
+        desktop_log = log_snapshots["desktop"].full_text
+        if agent_log:
+            agent_log = dump_text + "\n\n--- full agent.log ---\n" + agent_log
+        if gateway_log:
+            gateway_log = dump_text + "\n\n--- full gateway.log ---\n" + gateway_log
+        if gui_log:
+            gui_log = dump_text + "\n\n--- full gui.log ---\n" + gui_log
+        if desktop_log:
+            desktop_log = dump_text + "\n\n--- full desktop.log ---\n" + desktop_log
+        if redact:
+            report = _REDACTION_BANNER + report
+            if agent_log:
+                agent_log = _REDACTION_BANNER + agent_log
+            if gateway_log:
+                gateway_log = _REDACTION_BANNER + gateway_log
+            if gui_log:
+                gui_log = _REDACTION_BANNER + gui_log
+            if desktop_log:
+                desktop_log = _REDACTION_BANNER + desktop_log
+        print(report)
+        for title, body in (
+            ("FULL agent.log", agent_log),
+            ("FULL gateway.log", gateway_log),
+            ("FULL gui.log", gui_log),
+            ("FULL desktop.log", desktop_log),
+        ):
+            if body:
+                print(f"\n\n{'=' * 60}")
+                print(title)
+                print(f"{'=' * 60}\n")
+                print(body)
+        return
+
+    print(_PRIVACY_NOTICE)
+    print("Collecting debug report...")
+    print("Uploading...")
+
     try:
         urls["Report"] = upload_to_pastebin(report, expiry_days=expiry)
     except RuntimeError as exc:

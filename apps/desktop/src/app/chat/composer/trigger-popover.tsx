@@ -103,7 +103,52 @@ export function ComposerTriggerPopover({
               {description && (
                 <span className="min-w-0 flex-1 truncate leading-5 text-(--ui-text-tertiary)">{description}</span>
               )}
-            </button>
+              <button
+                className={cn(ROW_BASE_CLASS, isSlash ? 'flex-col gap-0' : 'items-center gap-2')}
+                data-highlighted={active ? '' : undefined}
+                onClick={() => onPick(item)}
+                onMouseEnter={() => onHover(index)}
+                type="button"
+              >
+                {isSlash ? (
+                  <>
+                    {/* Active row (keyboard nav or hover) un-truncates inline so
+                        long command names / descriptions stay readable without a
+                        floating tooltip. */}
+                    <span
+                      className={cn(
+                        'font-medium leading-snug text-foreground',
+                        active ? 'whitespace-normal break-words' : 'truncate'
+                      )}
+                    >
+                      {display}
+                    </span>
+                    {description && (
+                      <span
+                        className={cn(
+                          'leading-snug text-(--ui-text-tertiary)',
+                          active ? 'whitespace-normal break-words' : 'truncate'
+                        )}
+                      >
+                        {description}
+                      </span>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <span className="grid size-4 shrink-0 place-items-center text-(--ui-text-tertiary)">
+                      <Codicon name={atIcon(item)} size="0.875rem" />
+                    </span>
+                    <span className="min-w-0 shrink truncate font-mono font-medium leading-5 text-foreground">
+                      {display}
+                    </span>
+                    {description && (
+                      <span className="min-w-0 flex-1 truncate leading-5 text-(--ui-text-tertiary)">{description}</span>
+                    )}
+                  </>
+                )}
+              </button>
+            </Fragment>
           )
         })
       )}

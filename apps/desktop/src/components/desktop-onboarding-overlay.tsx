@@ -113,13 +113,7 @@ const PROVIDER_DISPLAY: Record<string, { order: number; title: string }> = {
 
 const assetPath = (path: string) => `${import.meta.env.BASE_URL}${path.replace(/^\/+/, '')}`
 
-const FLOW_SUBTITLES: Record<OAuthProvider['flow'], string> = {
-  pkce: 'Opens your browser to sign in, then continues here',
-  device_code: 'Opens a verification page in your browser — Hermes connects automatically',
-  external: 'Sign in once in your terminal, then come back to chat'
-}
-
-const providerTitle = (p: OAuthProvider) => PROVIDER_DISPLAY[p.id]?.title ?? p.name
+export const providerTitle = (p: OAuthProvider) => PROVIDER_DISPLAY[p.id]?.title ?? p.name
 const orderOf = (p: OAuthProvider) => PROVIDER_DISPLAY[p.id]?.order ?? 99
 
 const sortProviders = (providers: OAuthProvider[]) =>
