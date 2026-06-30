@@ -33,11 +33,59 @@ from urllib.parse import urljoin, urlparse, urlunparse
 import httpx
 import yaml
 
+from tools.guarded_write import (
+    GuardedWriteError,
+    SinkSpec,
+    guarded_write,
+    register_persistent_re_registration,
+    register_sink,
+)
 from tools.skills_guard import (
     ScanResult, content_hash, TRUSTED_REPOS,
 )
 from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
+
+
+# ---------------------------------------------------------------------------
+# Guarded sink registration — github.app_auth
+# ---------------------------------------------------------------------------
+# The GitHub App installation-tokens endpoint is a sensitive write target:
+# the response contains a bearer token that authorises a one-hour window
+# of GitHub API access. Without a guard, a tool result that contained
+# crafted URL fragments could redirect the JWT exchange to an attacker-
+# controlled endpoint. The guard pipeline enforces:
+#   1. URL/path sanitisation (the URL is built from the installation_id
+#      env var, which the sanitizer will reject if it contains traversal
+#      sequences or unexpected schemes)
+#   2. Principal allow-list (only the skills-hub module can mint tokens)
+#   3. Rate limit (20 calls per 60s — matches GitHub's app token bucket)
+def _github_app_auth_writer(payload: Dict[str, Any]) -> httpx.Response:
+    return httpx.post(
+        payload["url"],
+        headers=payload["headers"],
+        timeout=payload["timeout"],
+    )
+
+
+def _register_github_app_sink() -> None:
+    try:
+        register_sink(
+            "github.app_auth",
+            SinkSpec(
+                kind="http",
+                writer=_github_app_auth_writer,
+                allowed_principals={"skills-hub", "default"},
+                rate_limit=(20, 60.0),
+                description="GitHub App installation-tokens endpoint (skills_hub)",
+            ),
+        )
+    except ValueError:
+        pass  # already registered
+
+
+_register_github_app_sink()
+register_persistent_re_registration(_register_github_app_sink)
 
 logger = logging.getLogger(__name__)
 
@@ -338,14 +386,27 @@ class GitHubAuth:
             }
             encoded_jwt = jwt.encode(payload, private_key, algorithm="RS256")
 
-            resp = httpx.post(
-                f"https://api.github.com/app/installations/{installation_id}/access_tokens",
-                headers={
-                    "Authorization": f"Bearer {encoded_jwt}",
-                    "Accept": "application/vnd.github.v3+json",
-                },
-                timeout=10,
-            )
+            # Guarded write: the URL is built from the installation_id env
+            # var and the JWT is built from the private key file. The
+            # sanitizer catches any path-traversal in installation_id; the
+            # principal gate catches any caller that isn't skills-hub.
+            try:
+                resp = guarded_write(
+                    "github.app_auth",
+                    {
+                        "url": f"https://api.github.com/app/installations/{installation_id}/access_tokens",
+                        "headers": {
+                            "Authorization": f"Bearer {encoded_jwt}",
+                            "Accept": "application/vnd.github.v3+json",
+                        },
+                        "timeout": 10,
+                    },
+                    principal="skills-hub",
+                )
+            except GuardedWriteError as exc:
+                # Guard rejection is permanent (don't retry, don't escalate).
+                logger.debug(f"GitHub App auth denied by guard: {exc.reason}")
+                return None
             if resp.status_code == 201:
                 return resp.json().get("token")
         except Exception as e:

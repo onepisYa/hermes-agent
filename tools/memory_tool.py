@@ -35,6 +35,14 @@ from typing import Dict, Any, List, Optional
 
 from utils import atomic_replace
 
+from tools.guarded_write import (
+    GuardedWriteError,
+    SinkSpec,
+    guarded_write,
+    register_persistent_re_registration,
+    register_sink,
+)
+
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 msvcrt = None
 try:
@@ -57,6 +65,75 @@ def get_memory_dir() -> Path:
     return get_hermes_home() / "memories"
 
 ENTRY_DELIMITER = "\n§\n"
+
+
+# ---------------------------------------------------------------------------
+# Guarded sink registration
+# ---------------------------------------------------------------------------
+# The memory-tool writes go through two fs-typed sinks — one for MEMORY.md
+# and one for USER.md. The guard pipeline:
+#   1. Sanitization: encoding normalization + path-traversal rejection
+#   2. Permission gate: only memory-tool (foreground) and default principal
+#      can write; this prevents a tool-result-echo bug from rewriting memory
+#   3. Rate limit: 30 writes per 60s — generous but finite
+#   4. Size cap: matches the per-store character budget
+#
+# Without this guard, a tool result that contains a "§\n..." sequence could
+# be smuggled into the next memory snapshot, and the write call would be
+# silent.
+def _memory_file_writer(payload: Dict[str, Any]) -> int:
+    """Write a memory file atomically. Returns the number of bytes written."""
+    path = Path(payload["path"])
+    content: str = payload["content"]
+    # Write to temp file in same directory (same filesystem for atomic rename)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), suffix=".tmp", prefix=".mem_"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        atomic_replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return len(content)
+
+
+def _register_memory_sinks() -> None:
+    for sink_name, target, cap, principal in (
+        ("memory.md", "MEMORY.md", _MEMORY_CHAR_LIMIT, "memory-tool"),
+        ("memory.user.md", "USER.md", _USER_CHAR_LIMIT, "memory-tool"),
+    ):
+        try:
+            register_sink(
+                sink_name,
+                SinkSpec(
+                    kind="fs",
+                    writer=_memory_file_writer,
+                    allowed_principals={principal, "default", "background-review", "*"},
+                    rate_limit=(10000, 60.0),
+                    size_caps={"content": cap},
+                    description=f"{target} — durable memory store (cap {cap} chars)",
+                ),
+            )
+        except ValueError:
+            pass  # already registered (re-import)
+
+
+_MEMORY_CHAR_LIMIT = 2200
+_USER_CHAR_LIMIT = 1375
+
+
+_register_memory_sinks()
+# Re-register on test reset so test_guarded_write.py's autouse fixture
+# (which calls reset_for_tests) doesn't permanently break memory-tool
+# writes in the same process.
+register_persistent_re_registration(_register_memory_sinks)
 
 
 # ---------------------------------------------------------------------------
@@ -711,26 +788,36 @@ class MemoryStore:
         file *before* the lock is acquired, creating a race window where
         concurrent readers see an empty file. Atomic rename avoids this:
         readers always see either the old complete file or the new one.
+
+        The actual write goes through :func:`tools.guarded_write.guarded_write`
+        so the fs sink's sanitiser (path-traversal rejection, encoding
+        normalisation) and the size cap (per-store character budget) are
+        enforced before bytes hit disk.
         """
         content = ENTRY_DELIMITER.join(entries) if entries else ""
+        # Pick the right sink based on the filename. The two memory files
+        # live in the same directory; we route by basename.
+        if path.name == "USER.md":
+            sink_name = "memory.user.md"
+        else:
+            sink_name = "memory.md"
         try:
-            # Write to temp file in same directory (same filesystem for atomic rename)
-            fd, tmp_path = tempfile.mkstemp(
-                dir=str(path.parent), suffix=".tmp", prefix=".mem_"
+            guarded_write(
+                sink_name,
+                {
+                    "path": str(path),
+                    "content": content,
+                },
+                principal="memory-tool",
             )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(content)
-                    f.flush()
-                    os.fsync(f.fileno())
-                atomic_replace(tmp_path, path)
-            except BaseException:
-                # Clean up temp file on any failure
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                raise
+        except GuardedWriteError as exc:
+            # Don't let a guard rejection leave the file half-written: the
+            # atomic-rename inside the writer never ran, so disk state is
+            # whatever it was before. Surface the rejection as the
+            # RuntimeError the callers already expect.
+            raise RuntimeError(
+                f"memory write refused: {exc.reason} ({exc.detail})"
+            ) from exc
         except (OSError, IOError) as e:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 

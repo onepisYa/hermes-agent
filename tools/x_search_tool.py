@@ -50,6 +50,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+from tools.guarded_write import (
+    GuardedWriteError,
+    SinkSpec,
+    guarded_write,
+    register_persistent_re_registration,
+    register_sink,
+)
 from tools.registry import registry, tool_error
 from tools.xai_http import hermes_xai_user_agent, resolve_xai_http_credentials
 
@@ -60,6 +67,51 @@ DEFAULT_X_SEARCH_MODEL = "grok-4.20-reasoning"
 DEFAULT_X_SEARCH_TIMEOUT_SECONDS = 180
 DEFAULT_X_SEARCH_RETRIES = 2
 MAX_HANDLES = 10
+
+
+# ---------------------------------------------------------------------------
+# Guarded sink registration
+# ---------------------------------------------------------------------------
+# The xai.responses sink wraps the outbound HTTP call to xAI's
+# /responses endpoint. The guard pipeline runs:
+#   1. Sanitization (default HTTP sanitizer: HTML-escape body fields,
+#      enforce size caps, normalise encoding)
+#   2. Permission gate (principal must be in the allow-list)
+#   3. Rate limit (60 calls per 60s — matches existing xAI rate budget)
+#   4. Actual HTTP POST via the writer closure
+#
+# Without this guard, the existing code made an unauthenticated-style
+# outbound call with the user's query as the body — fine when the query
+# is a string the user typed, risky if the query is a tool result that
+# contains HTML/JS/SQL fragments that downstream citations might echo.
+def _xai_responses_writer(payload: Dict[str, Any]) -> requests.Response:
+    return requests.post(
+        payload["url"],
+        headers=payload["headers"],
+        json=payload["body"],
+        timeout=payload["timeout"],
+    )
+
+
+def _register_xai_sink() -> None:
+    try:
+        register_sink(
+            "xai.responses",
+            SinkSpec(
+                kind="http",
+                writer=_xai_responses_writer,
+                allowed_principals={"x-search-tool", "default"},
+                rate_limit=(60, 60.0),
+                size_caps={"query": 4096, "from_date": 10, "to_date": 10},
+                description="xAI /responses endpoint (x_search_tool)",
+            ),
+        )
+    except ValueError:
+        pass  # already registered (re-import)
+
+
+_register_xai_sink()
+register_persistent_re_registration(_register_xai_sink)
 
 
 # ---------------------------------------------------------------------------
@@ -330,18 +382,38 @@ def x_search_tool(
         response: Optional[requests.Response] = None
         for attempt in range(max_retries + 1):
             try:
-                response = requests.post(
-                    f"{base_url}/responses",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                        "User-Agent": hermes_xai_user_agent(),
+                # Guarded write: the payload (and URL) are sanitized +
+                # permission-checked + rate-limited before the HTTP POST
+                # is performed. GuardedWriteError is treated as a permanent
+                # failure (don't retry — retrying won't fix a sanitizer
+                # rejection or a missing-principal case).
+                response = guarded_write(
+                    "xai.responses",
+                    {
+                        "url": f"{base_url}/responses",
+                        "headers": {
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                            "User-Agent": hermes_xai_user_agent(),
+                        },
+                        "body": payload,
+                        "timeout": timeout_seconds,
+                        "query": query.strip(),
                     },
-                    json=payload,
-                    timeout=timeout_seconds,
+                    principal="x-search-tool",
                 )
+                assert response is not None, "guarded_write returned None"
                 response.raise_for_status()
                 break
+            except GuardedWriteError as exc:
+                # Don't retry — sanitizer / permission failures are
+                # permanent. Surface to the caller as a tool error so the
+                # agent can decide what to do (rephrase, drop, escalate).
+                logger.warning(
+                    "x_search guarded_write denied: %s",
+                    exc.to_log_dict(),
+                )
+                return tool_error(f"x_search write denied: {exc.reason}")
             except requests.HTTPError as e:
                 status_code = getattr(getattr(e, "response", None), "status_code", None)
                 if status_code is None or status_code < 500 or attempt >= max_retries:

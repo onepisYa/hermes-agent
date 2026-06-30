@@ -263,6 +263,11 @@ class TestScanMemoryContent:
 def store(tmp_path, monkeypatch):
     """Create a MemoryStore with temp storage."""
     monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+    # The guard pipeline's rate limiter is process-global; reset it for
+    # each test so the per-test fixtures don't trip the 30/60s rate limit
+    # when many tests run in sequence.
+    from tools.guarded_write import _registry
+    _registry._rate_limiter.reset()
     s = MemoryStore(memory_char_limit=500, user_char_limit=300)
     s.load_from_disk()
     return s
