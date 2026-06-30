@@ -1170,6 +1170,403 @@ def test_complete_records_result(kanban_home):
     assert task.completed_at is not None
 
 
+def test_complete_scrubs_phantom_ids_from_summary(kanban_home):
+    """Regression: a completion summary containing ``t_<hex>`` tokens
+    that don't resolve to any row on this board must NOT keep those
+    bare tokens in the persisted ``task_runs.summary`` / ``task_runs.result``.
+
+    The original bug (t_77a7fbf2) saw t_96055b24's run row storing
+    ``recheck-t_6af7531e`` + ``recheck-t_92c676be`` verbatim, leaving
+    downstream consumers to chase ids that didn't exist. The fix
+    rewrites each phantom in-place to ``<unknown:TAG>`` so:
+
+      1. No bare phantom id survives in the stored row (parseable
+         downstream, no dead links).
+      2. The operator can still SEE which id the worker hallucinated,
+         wrapped in a marker that cannot itself be mistaken for an id.
+      3. Resolved ids — references to tasks that DO exist on this
+         board — are passed through untouched so legitimate cross-task
+         mentions still read naturally.
+
+    Verifies both the scan helper in isolation AND the end-to-end
+    ``complete_task`` rewrite path so the contract holds at the source.
+    """
+    import json as _json
+    import re as _re
+    # Match the same lookbehind the runtime regex uses, so a
+    # token wrapped in ``<unknown:...>`` is NOT picked up as a bare
+    # id by this assertion regex.
+    _bare_id = _re.compile(
+        r"(?<!<unknown:)\bt_[a-f0-9]{8,}\b"
+    )
+    with kb.connect() as conn:
+        # Seed one real card so we can assert it is NOT touched by the
+        # scrubber — only the two phantom ids should be rewritten.
+        real_id = kb.create_task(conn, title="real card")
+        target = kb.create_task(conn, title="target")
+
+    phantom_a = "t_deadbeef99"
+    phantom_b = "t_92c676be"
+    summary_in = (
+        f"前情基于 recheck-{phantom_a} best=88 + "
+        f"recheck-{phantom_b} 真实答卷打分，对照 {real_id} 复核。"
+    )
+    result_in = (
+        f"summary 体包含 {phantom_a} 引用，定位 {real_id} 真实任务；"
+        f"另参考 {phantom_b} 反例。"
+    )
+
+    # --- 1. Helper-level contract: bare phantoms become markers,
+    #         resolved ids pass through.
+    with kb.connect() as conn:
+        phantoms, scrubbed = kb._scan_prose_for_phantom_ids(conn, summary_in)
+    assert phantoms == [phantom_a, phantom_b], phantoms
+    # The marker is ``<unknown:phantom>`` — substring containment is a
+    # false-positive (the bare token IS a substring of the marker).
+    # Ask the runtime regex directly: does the scrubbed text still
+    # have a parseable bare ``t_<hex>`` outside a marker?
+    scrub_bare = _bare_id.findall(scrubbed)
+    assert phantom_a not in scrub_bare, (
+        f"scrubbed text still has bare phantom {phantom_a!r}: {scrubbed!r}"
+    )
+    assert phantom_b not in scrub_bare, (
+        f"scrubbed text still has bare phantom {phantom_b!r}: {scrubbed!r}"
+    )
+    assert f"<unknown:{phantom_a}>" in scrubbed
+    assert f"<unknown:{phantom_b}>" in scrubbed
+    # Resolved id survives untouched.
+    assert real_id in scrub_bare, (
+        f"scrubbed text lost the resolved id {real_id}: {scrubbed!r}"
+    )
+    # Cross-scan safety: scrubbing an already-scrubbed summary is a
+    # no-op (the marker is NOT a valid kanban token so the regex
+    # never re-matches).
+    with kb.connect() as conn:
+        phantoms2, scrubbed2 = kb._scan_prose_for_phantom_ids(conn, scrubbed)
+    assert phantoms2 == []
+    assert scrubbed2 == scrubbed, "idempotent scrub must not double-rewrite"
+
+    # --- 2. End-to-end: complete_task persists the SCRUBBED form.
+    with kb.connect() as conn:
+        assert kb.complete_task(conn, target, summary=summary_in, result=result_in)
+        run = kb.latest_run(conn, target)
+        task = kb.get_task(conn, target)
+    assert run is not None and task is not None
+    # Stored rows contain the marker form, never the bare phantom.
+    # ``summary`` lives on task_runs; ``result`` lives on tasks.
+    for field_name, stored in (("summary", run.summary), ("result", task.result)):
+        # The marker ``<unknown:t_xxx>`` deliberately contains the
+        # bare token as a substring, so a plain ``in`` check would
+        # false-positive. Use a word-boundary regex to ask "does this
+        # field contain a bare, parseable t_<hex> token?" — the marker
+        # is NOT a bare token because of its ``<unknown:`` prefix.
+        bare_matches = _bare_id.findall(stored or "")
+        assert phantom_a not in bare_matches, (
+            f"{field_name} still contains bare phantom {phantom_a!r}: {stored!r}"
+        )
+        assert phantom_b not in bare_matches, (
+            f"{field_name} still contains bare phantom {phantom_b!r}: {stored!r}"
+        )
+        assert f"<unknown:{phantom_a}>" in stored, (
+            f"{field_name} missing marker for {phantom_a}: {stored!r}"
+        )
+        assert f"<unknown:{phantom_b}>" in stored, (
+            f"{field_name} missing marker for {phantom_b}: {stored!r}"
+        )
+        # Resolved id preserved verbatim (also a bare token, but a
+        # REAL one that we want to keep visible to consumers).
+        assert real_id in bare_matches, (
+            f"{field_name} lost the resolved id {real_id}: {stored!r}"
+        )
+
+    # --- 3. Audit trail: both expected events landed on the log.
+    with kb.connect() as conn:
+        events = [
+            (r["kind"], _json.loads(r["payload"]) if r["payload"] else {})
+            for r in conn.execute(
+                "SELECT kind, payload FROM task_events "
+                "WHERE task_id = ? ORDER BY id ASC",
+                (target,),
+            ).fetchall()
+        ]
+    kinds = [k for k, _ in events]
+    assert "suspected_hallucinated_references" in kinds
+    assert "summary_phantom_ids_scrubbed" in kinds
+    scrub_event = next(p for k, p in events if k == "summary_phantom_ids_scrubbed")
+    assert set(scrub_event["phantom_refs"]) == {phantom_a, phantom_b}
+    # Both rewritten fields are recorded (we passed both summary and result).
+    assert set(scrub_event["rewritten_fields"]) == {"summary", "result"}
+
+
+def test_complete_preserves_summary_when_no_phantoms(kanban_home):
+    """Counter-test for test_complete_scrubs_phantom_ids_from_summary:
+    when the summary references only IDs that DO exist on the board,
+    the scrubber returns no phantoms and ``complete_task`` MUST leave
+    the stored summary verbatim — no marker rewriting, no spurious
+    audit events.
+    """
+    with kb.connect() as conn:
+        sibling = kb.create_task(conn, title="sibling")
+        target = kb.create_task(conn, title="target")
+
+    summary_in = (
+        f"基于 {sibling} 的前置产物完成；无 hallucination；交付落档 workspace。"
+    )
+    result_in = f"指向 {sibling} 的引用。"
+
+    with kb.connect() as conn:
+        assert kb.complete_task(conn, target, summary=summary_in, result=result_in)
+        run = kb.latest_run(conn, target)
+        task = kb.get_task(conn, target)
+    assert run is not None and task is not None
+    # Verbatim round-trip — no markers, no replacements.
+    assert run.summary == summary_in
+    assert task.result == result_in
+    # No phantom audit events were emitted.
+    with kb.connect() as conn:
+        kinds = [
+            r["kind"]
+            for r in conn.execute(
+                "SELECT kind FROM task_events "
+                "WHERE task_id = ? AND kind IN "
+                "('suspected_hallucinated_references', 'summary_phantom_ids_scrubbed')",
+                (target,),
+            ).fetchall()
+        ]
+    assert kinds == [], f"unexpected phantom-related events on a clean run: {kinds}"
+
+
+def test_complete_marks_phantom_in_result_only(kanban_home):
+    """Edge case: only ``result`` mentions a phantom; ``summary`` is
+    clean. Both fields are independent in the storage path — the
+    scrubber must touch only the one that's dirty, not the clean one.
+    """
+    with kb.connect() as conn:
+        target = kb.create_task(conn, title="target")
+
+    phantom = "t_cafef00d"
+    result_in = f"前置 recheck-{phantom} best=88。"
+
+    with kb.connect() as conn:
+        assert kb.complete_task(conn, target, summary="clean summary", result=result_in)
+        run = kb.latest_run(conn, target)
+        task = kb.get_task(conn, target)
+    assert run is not None and task is not None
+    assert run.summary == "clean summary"
+    # The marker ``<unknown:phantom>`` is a substring of the original
+    # ``phantom`` token, so use a word-boundary regex with the same
+    # ``<unknown:`` lookbehind the runtime uses to ask "is the bare
+    # token still parseable as a real id?".
+    import re as _re_edge
+    _bare_phantom = _re_edge.compile(
+        r"(?<!<unknown:)\b" + _re_edge.escape(phantom) + r"\b"
+    )
+    assert not _bare_phantom.search(task.result or ""), (
+        f"result still has bare phantom {phantom!r}: {task.result!r}"
+    )
+    assert f"<unknown:{phantom}>" in task.result
+
+
+# ---------------------------------------------------------------------------
+# Dangling-reference handling on created_cards
+# ---------------------------------------------------------------------------
+# Acceptance criterion for t_f90aabe8: "completion with valid ids,
+# completion referencing a deleted task, and board import with stale ids".
+# ``_verify_created_cards`` partitions claimed ids into (verified, phantom);
+# the dangling-reference test surface sits at this helper plus the
+# end-to-end ``complete_task`` path that raises HallucinatedCardsError when
+# any phantom leaks through. The existing phantom-detection pipeline in
+# kanban_db.py already labels (not silently drops) unknown ids — these
+# tests pin that contract so a future refactor can't regress it.
+
+
+def test_verify_created_cards_partitions_valid_deleted_and_stale(kanban_home):
+    """``_verify_created_cards`` is the defensive helper that
+    distinguishes the three reference cases that show up on a real
+    board: a card the completing worker owns, a card that was deleted
+    between the worker's spawn call and its completion call (race),
+    and a stale id from a prior board import that never resolved.
+
+    The helper must label each class explicitly so ``complete_task``
+    can either accept (verified) or block-with-audit (phantom) — never
+    silently drop.
+    """
+    with kb.connect() as conn:
+        completer = kb.create_task(conn, title="completer", assignee="alice")
+        owned = kb.create_task(
+            conn, title="owned", assignee="x", created_by="alice",
+        )
+        # Build the "raced deleted" target: exists when created, then
+        # hard-deleted before completion lands. Stash its id because the
+        # row no longer exists after the delete.
+        raced = kb.create_task(conn, title="raced", assignee="x")
+        raced_id = raced
+        kb.delete_task(conn, raced_id)
+        # "Stale-from-board-import" target: an id that never existed
+        # in this DB (e.g. an id minted on another board that was
+        # imported as a JSON event payload).
+        stale = "t_99999999"
+
+    with kb.connect() as conn:
+        verified, phantom = kb._verify_created_cards(
+            conn, completer, [owned, raced_id, stale],
+        )
+
+    # Owned card survives.
+    assert owned in verified
+    # Deleted-card id is treated as phantom (defensive-label, not
+    # silent-drop) so the caller knows to retry without it.
+    assert raced_id in phantom
+    assert stale in phantom
+    # Symmetry: every claimed id ends up in exactly one bucket.
+    assert sorted(verified + phantom) == sorted([owned, raced_id, stale])
+    assert not (set(verified) & set(phantom))
+
+
+def test_complete_with_valid_created_cards_succeeds_and_audits(kanban_home):
+    """Happy-path completion: every claimed ``created_cards`` id exists
+    and is owned by the completing worker's profile. The completion
+    succeeds, the audit event carries the verified list, and NO
+    ``completion_blocked_hallucination`` event is emitted.
+    """
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        child_a = kb.create_task(
+            conn, title="child-a", assignee="x", created_by="alice",
+        )
+        child_b = kb.create_task(
+            conn, title="child-b", assignee="x", created_by="alice",
+        )
+
+    with kb.connect() as conn:
+        assert kb.complete_task(
+            conn, parent,
+            summary="siblings all good",
+            created_cards=[child_a, child_b],
+        )
+
+    import json as _json
+    with kb.connect() as conn:
+        completed = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='completed' ORDER BY id DESC LIMIT 1",
+            (parent,),
+        ).fetchone()
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+                (parent,),
+            ).fetchall()
+        ]
+
+    assert completed is not None
+    payload = _json.loads(completed["payload"])
+    assert sorted(payload["verified_cards"]) == sorted([child_a, child_b])
+    # No phantom-block audit event on a clean run.
+    assert "completion_blocked_hallucination" not in kinds
+
+
+def test_complete_with_deleted_task_id_in_created_cards_raises_and_audits(kanban_home):
+    """Dangling-reference case: a card the worker spawned was deleted
+    by another worker mid-run before completion landed. ``complete_task``
+    must raise HallucinatedCardsError naming the deleted id, leave the
+    task in its prior state, and emit ``completion_blocked_hallucination``
+    so the dashboard surfaces the issue rather than silently succeeding.
+    """
+    import json as _json
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        raced = kb.create_task(conn, title="raced", assignee="x")
+        raced_id = raced
+        # Another worker hard-deletes the raced card. The completing
+        # worker's memory of the id is now stale.
+        kb.delete_task(conn, raced_id)
+        # Sanity: the row is truly gone — only the parent remains.
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE id IN (?, ?)",
+            (parent, raced_id),
+        ).fetchall()
+        assert {r["id"] for r in rows} == {parent}
+
+    with kb.connect() as conn:
+        with pytest.raises(kb.HallucinatedCardsError) as excinfo:
+            kb.complete_task(
+                conn, parent,
+                summary="child got deleted",
+                created_cards=[raced_id],
+            )
+    assert excinfo.value.phantom == [raced_id]
+
+    with kb.connect() as conn:
+        # Task stays in its prior state — raise path does NOT mutate.
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (parent,),
+        ).fetchone()
+        assert row["status"] == "ready"
+
+        # Audit event lands on the event log with both buckets so
+        # operators can see what got rejected and what still resolves.
+        block = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='completion_blocked_hallucination'",
+            (parent,),
+        ).fetchone()
+        assert block is not None
+        payload = _json.loads(block["payload"])
+        assert payload["phantom_cards"] == [raced_id]
+        assert payload["verified_cards"] == []
+
+
+def test_complete_with_stale_board_import_id_in_created_cards_raises(kanban_home):
+    """Board-import scenario: a worker cites an id that was minted on a
+    different board and survived an archived-then-resurrected workflow.
+    No row exists in this DB at any point — the id is structurally
+    valid (kanban shape) but lexically orphan.
+
+    The contract is the same as the deleted-task case: defensive label,
+    audit event, raise. The two should not diverge in behaviour —
+    operators triage them through the dashboard without having to know
+    the underlying origin story.
+    """
+    import json as _json
+
+    stale = "t_99999999"  # never assigned on this board
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        # Sanity: the stale id really does not resolve.
+        assert conn.execute(
+            "SELECT 1 FROM tasks WHERE id=?", (stale,),
+        ).fetchone() is None
+
+    with kb.connect() as conn:
+        with pytest.raises(kb.HallucinatedCardsError) as excinfo:
+            kb.complete_task(
+                conn, parent,
+                summary="reference from prior board",
+                created_cards=[stale],
+            )
+    assert excinfo.value.phantom == [stale]
+
+    with kb.connect() as conn:
+        block = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='completion_blocked_hallucination'",
+            (parent,),
+        ).fetchone()
+        assert block is not None
+        payload = _json.loads(block["payload"])
+        assert stale in payload["phantom_cards"]
+        # No task_runs row was opened — completion never reached the
+        # status-mutation path. The task remains in the pre-completion
+        # state for a retry with a corrected list.
+        run = kb.latest_run(conn, parent)
+        if run is not None:
+            assert run.outcome != "completed"
+        assert kb.get_task(conn, parent).status == "ready"
+
+
 def test_block_then_unblock(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")

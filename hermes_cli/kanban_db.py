@@ -3707,29 +3707,89 @@ def _verify_created_cards(
     return verified, phantom
 
 
-# Task-id pattern used both by ``kanban_create`` (``t_<12 hex>``) and
-# ``_new_task_id`` below. Kept permissive on length for forward compat:
-# accept 8+ hex chars after the ``t_`` prefix.
-_TASK_ID_PROSE_RE = re.compile(r"\bt_[a-f0-9]{8,}\b")
+# Token grammar used by ``_scan_prose_for_phantom_ids`` on completion
+# summaries. Two flavors of suspicious reference are recognised:
+#   - ``t_<8+ hex>``           : kanban task id shape (checked against ``tasks``)
+#   - ``<prefix>:<8+ hex>``    : known off-board handle shapes (recheck/scan/
+#                                exam/digest — botlearn subagent handles that
+#                                are NOT kanban ids but get cited in prose).
+# Both shapes are routed through the same phantom-detection pipeline; off-board
+# shapes are flagged because they can never resolve via the SELECT below
+# (no such rows exist in ``tasks``). Length is permissive (8+ hex) for forward
+# compat, matching the ``kanban_create`` / ``_new_task_id`` policy.
+#
+# The leading ``(?<!<unknown:)`` lookbehind prevents the regex from
+# re-matching a token that has already been wrapped in a
+# ``<unknown:...>`` marker by :func:`_scrub_phantom_ids`. Without it,
+# the scan would re-detect the bare id sitting inside the marker text
+# on a re-scan, defeating the idempotency guarantee.
+_TASK_ID_PROSE_RE = re.compile(
+    r"(?<!<unknown:)\b(?:t_[a-f0-9]{8,}|(?:recheck|scan|exam|digest):[a-f0-9]{8,})\b"
+)
+
+
+def _scrub_phantom_ids(text: str, phantom_refs: list[str]) -> str:
+    """Rewrite phantom ``t_<hex>`` (and off-board handle) tokens in
+    ``text`` to their marker form ``<unknown:TAG>``.
+
+    ``phantom_refs`` is the deduped list returned by
+    :func:`_scan_prose_for_phantom_ids`. Each entry is rewritten using
+    the same regex; resolved ids in the same text are left untouched.
+    Whitespace and surrounding punctuation are preserved. An empty
+    ``text`` or empty ``phantom_refs`` returns ``text`` verbatim.
+
+    Split out from :func:`_scan_prose_for_phantom_ids` so callers that
+    already know the phantom set (e.g. the per-row update path in
+    ``complete_task``) can scrub without re-running the SQL lookup.
+
+    The marker is the literal ``<unknown:`` prefix — a leading angle
+    bracket is NOT a word character so ``_TASK_ID_PROSE_RE`` (which
+    uses ``\b``) cannot re-match a token sitting inside the marker.
+    That property is what makes the rewrite idempotent and safe to
+    re-scan.
+    """
+    if not text or not phantom_refs:
+        return text
+    phantom_set = set(phantom_refs)
+    return _TASK_ID_PROSE_RE.sub(
+        lambda mo: f"<unknown:{mo.group(0)}>" if mo.group(0) in phantom_set else mo.group(0),
+        text,
+    )
 
 
 def _scan_prose_for_phantom_ids(
     conn: sqlite3.Connection,
     text: str,
-) -> list[str]:
-    """Regex-scan free-form text for ``t_<hex>`` references; return the
-    ones that don't exist in ``tasks``.
+) -> tuple[list[str], str]:
+    """Regex-scan free-form text for ``t_<hex>`` (and off-board handle)
+    references; return (phantoms, scrubbed_text).
 
-    Used as a non-blocking advisory check on completion summaries. An
-    empty return means "no suspicious references found" — either the
-    text had no IDs at all, or every ID it mentioned resolves to a real
-    task. Duplicates are deduped.
+    ``phantoms`` is the list of distinct token shapes that look like
+    kanban task ids but do NOT resolve to a row in ``tasks`` on the
+    current board. Order matches first appearance in ``text``.
+
+    ``scrubbed_text`` is ``text`` with every phantom token rewritten to
+    a clearly-distinguishable marker of the form ``<unknown:TAG>`` where
+    ``TAG`` is the original token (e.g. ``<unknown:t_deadbeef99>`` or
+    ``<unknown:recheck:6af7531e>``). Resolved ids — those that DO exist
+    in ``tasks`` — are passed through untouched so legitimate cross-task
+    references still read naturally in the summary.
+
+    The marker shape is deliberately NOT a valid kanban id (no row will
+    ever satisfy ``<unknown:...>``) and survives any prose re-scan,
+    which means a worker cannot accidentally turn an unknown marker back
+    into a bare id by re-emitting it.
+
+    An empty phantom list means "no suspicious references found" —
+    either the text had no IDs at all, or every ID it mentioned
+    resolves to a real task. ``scrubbed_text`` then equals ``text``
+    verbatim.
     """
     if not text:
-        return []
+        return [], text
     matches = _TASK_ID_PROSE_RE.findall(text)
     if not matches:
-        return []
+        return [], text
     # Dedupe preserving order.
     seen: set[str] = set()
     unique: list[str] = []
@@ -3743,7 +3803,19 @@ def _scan_prose_for_phantom_ids(
         tuple(unique),
     ).fetchall()
     existing = {r["id"] for r in rows}
-    return [m for m in unique if m not in existing]
+    phantoms = [m for m in unique if m not in existing]
+    if not phantoms:
+        return [], text
+    # Rewrite phantom tokens in-place. ``re.sub`` replaces non-
+    # overlapping matches; iterating over the phantom list (which is
+    # deduped) keeps the substitution order stable and the diff
+    # human-readable.
+    phantom_set = set(phantoms)
+    scrubbed = _TASK_ID_PROSE_RE.sub(
+        lambda mo: f"<unknown:{mo.group(0)}>" if mo.group(0) in phantom_set else mo.group(0),
+        text,
+    )
+    return phantoms, scrubbed
 
 
 class HallucinatedCardsError(ValueError):
@@ -3913,24 +3985,68 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
-    # Prose-scan the summary + result for t_<hex> references that do
-    # not resolve. Advisory — does not block the completion. Runs in
-    # its own txn so the completion itself is already durable by the
-    # time we emit the warning.
+    # Prose-scan the summary + result for t_<hex> (and off-board handle)
+    # references that do not resolve. Two outcomes:
+    #
+    #   * clean — no phantoms found. Emit nothing further.
+    #   * dirty — one or more phantom ids leaked into the worker's prose.
+    #     The completion itself is durable, but we now ALSO overwrite the
+    #     stored summary/result with the scrubbed form so downstream
+    #     consumers (build_worker_context, dashboard render, gateway
+    #     notifier, log dump) never see the bare phantom id. Two events
+    #     land on the audit trail: the existing advisory
+    #     ``suspected_hallucinated_references`` carries the phantom list
+    #     for the diagnostics panel, and a sibling
+    #     ``summary_phantom_ids_scrubbed`` event records that the run
+    #     row was rewritten with the marker form so operators can
+    #     reconstruct exactly what changed.
+    #
+    # Runs in its own txn so the completion itself is already durable
+    # by the time we do any rewriting.
     scan_text = " ".join(filter(None, [summary, result]))
     if scan_text:
-        phantom_refs = _scan_prose_for_phantom_ids(conn, scan_text)
+        phantom_refs, _scrubbed = _scan_prose_for_phantom_ids(conn, scan_text)
         # Drop any phantom refs that were already flagged as verified
         # above (shouldn't happen — verified means they exist — but
         # belt-and-suspenders).
-        phantom_refs = [p for p in phantom_refs if p not in set(verified_cards)]
+        verified_set = set(verified_cards)
+        phantom_refs = [p for p in phantom_refs if p not in verified_set]
         if phantom_refs:
             with write_txn(conn):
+                # Rewrite the stored summary/result in place. The two
+                # fields live on different tables: ``summary`` on
+                # ``task_runs``, ``result`` on ``tasks``. Only the
+                # non-empty one gets scrubbed so we don't accidentally
+                # clobber a real value with a marker; whitespace is
+                # preserved verbatim.
+                if run_id is not None and summary:
+                    new_summary = _scrub_phantom_ids(summary, phantom_refs)
+                    conn.execute(
+                        "UPDATE task_runs SET summary = ? WHERE id = ?",
+                        (new_summary, run_id),
+                    )
+                if result:
+                    new_result = _scrub_phantom_ids(result, phantom_refs)
+                    conn.execute(
+                        "UPDATE tasks SET result = ? WHERE id = ?",
+                        (new_result, task_id),
+                    )
                 _append_event(
                     conn, task_id, "suspected_hallucinated_references",
                     {
                         "phantom_refs": phantom_refs,
                         "source": "completion_summary",
+                    },
+                    run_id=run_id,
+                )
+                _append_event(
+                    conn, task_id, "summary_phantom_ids_scrubbed",
+                    {
+                        "phantom_refs": phantom_refs,
+                        "rewritten_fields": [
+                            f for f in ("summary", "result")
+                            if (f == "summary" and summary) or (f == "result" and result)
+                        ],
                     },
                     run_id=run_id,
                 )
