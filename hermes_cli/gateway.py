@@ -3951,9 +3951,7 @@ def generate_launchd_plist() -> str:
     </dict>
 
     <key>LimitLoadToSessionType</key>
-    <array>
-        <string>Aqua</string>
-    </array>
+    <string>Aqua</string>
 
     <key>RunAtLoad</key>
     <true/>
