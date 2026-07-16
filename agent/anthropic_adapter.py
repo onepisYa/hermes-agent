@@ -32,11 +32,26 @@ from utils import base_url_host_matches, normalize_proxy_env_vars
 # paths. Access via the `_get_anthropic_sdk()` accessor below, which caches
 # the module after the first call and returns None on ImportError.
 _anthropic_sdk: Any = ...  # sentinel — None means "tried and missing"
+# Captures the last import-time exception (any flavour, not just ImportError)
+# so the operator-facing diagnostic can name the real cause instead of the
+# opaque "anthropic package is required" message. Diagnostic thread through
+# `_anthropic_unavailable_message(context)` below. See #30149.
+_anthropic_sdk_import_error: Optional[str] = None
 
 
 def _get_anthropic_sdk():
-    """Return the ``anthropic`` SDK module, importing lazily. None if not installed."""
+    """Return the ``anthropic`` SDK module, importing lazily. None if not installed.
+
+    On any import-time failure (including non-``ImportError`` flavours such as
+    ``RuntimeError`` / ``AttributeError`` from a stdlib skew), records the
+    underlying exception text into ``_anthropic_sdk_import_error`` so the
+    diagnostic helper below can surface it to the operator. Without this,
+    ``anthropic`` (and its transitive deps) can fail at module-import time on
+    newer Python releases while ``pip show`` reports the package as
+    installed — exactly the failure mode in #30149.
+    """
     global _anthropic_sdk
+    global _anthropic_sdk_import_error
     if _anthropic_sdk is ...:
         try:
             from tools.lazy_deps import ensure as _lazy_ensure
@@ -49,9 +64,43 @@ def _get_anthropic_sdk():
         try:
             import anthropic as _sdk
             _anthropic_sdk = _sdk
-        except ImportError:
+        except BaseException as _exc:  # noqa: BLE001 — capture any flavour
             _anthropic_sdk = None
+            try:
+                _anthropic_sdk_import_error = (
+                    f"{type(_exc).__name__}: {_exc}"
+                )
+            except Exception:
+                # str(exc) can itself raise on exotic object reprs.
+                _anthropic_sdk_import_error = type(_exc).__name__
     return _anthropic_sdk
+
+
+def _anthropic_unavailable_message(context: str) -> str:
+    """Operator-facing diagnostic for #30149.
+
+    Surfaces the four signals needed to self-diagnose a missing or broken
+    ``anthropic`` import: ``sys.executable``, the matching ``pip install``
+    command, the captured underlying exception (if any), and an explicit
+    interpreter-mismatch hint. Called by all three ``build_*`` callsites so
+    the message stays identical across providers.
+    """
+    import sys as _sys
+
+    interpreter = _sys.executable or "<unknown>"
+    underlying = _anthropic_sdk_import_error or "<none captured>"
+    return (
+        "The 'anthropic' package is required for the Anthropic provider but "
+        "could not be imported in this Python environment.\n"
+        f"Context: {context}\n"
+        f"Underlying import error: {underlying}\n"
+        f"Install it into THIS interpreter ({interpreter}):\n"
+        f"  {interpreter} -m pip install 'anthropic>=0.39.0'\n"
+        "If pip reports the package as already satisfied but Hermes still "
+        "raises this error, the install most likely landed in a different "
+        "Python interpreter than the one running Hermes (#30149) — verify "
+        "the interpreter path above matches the pip you ran."
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -651,8 +700,9 @@ def _build_anthropic_client_with_bearer_hook(
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
         raise ImportError(
-            "The 'anthropic' package is required for Azure Foundry Anthropic-style "
-            "endpoints with Entra ID auth. Install with: pip install 'anthropic>=0.39.0'"
+            _anthropic_unavailable_message(
+                context="Azure Foundry Anthropic-style endpoints with Entra ID auth"
+            )
         )
 
     normalize_proxy_env_vars()
@@ -738,8 +788,7 @@ def build_anthropic_client(
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
         raise ImportError(
-            "The 'anthropic' package is required for the Anthropic provider. "
-            "Install it with: pip install 'anthropic>=0.39.0'"
+            _anthropic_unavailable_message(context="native provider client")
         )
 
     # Callable api_key → Entra ID bearer provider path. Delegated to a
@@ -849,8 +898,7 @@ def build_anthropic_bedrock_client(region: str):
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
         raise ImportError(
-            "The 'anthropic' package is required for the Bedrock provider. "
-            "Install it with: pip install 'anthropic>=0.39.0'"
+            _anthropic_unavailable_message(context="Bedrock provider client")
         )
     if not hasattr(_anthropic_sdk, "AnthropicBedrock"):
         raise ImportError(
