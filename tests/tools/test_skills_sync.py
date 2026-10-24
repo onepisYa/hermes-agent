@@ -1035,3 +1035,76 @@ class TestCallTimeDirResolution:
                 ss._rmtree_writable(foreign)
         finally:
             reset_hermes_home_override(token)
+
+
+class TestExternalSymlinkCategoryNotDestroyed:
+    """A category dir under the local skills root may be a SYMLINK into an
+    external_dirs tree (``~/.hermes/skills/research -> ~/.agents/skills/research``).
+
+    The shadow-removal step in ``_defer_to_external`` used to call
+    ``_rmtree_writable(dest)`` on such a path. The scope guard (#48200) resolved
+    the symlink, saw a path outside the skills root, and raised ``ValueError`` —
+    which aborted the ENTIRE bundle sync, leaving every other skill un-seeded.
+    Two defects in one: the delete would have destroyed the user's external
+    repo, and the crash took the whole sync down with it.
+    """
+
+    def _setup(self, tmp_path):
+        bundled = tmp_path / "bundled_skills"
+        (bundled / "research" / "grounded-citations").mkdir(parents=True)
+        (bundled / "research" / "grounded-citations" / "SKILL.md").write_text("# bundled")
+        (bundled / "research" / "other-skill").mkdir(parents=True)
+        (bundled / "research" / "other-skill" / "SKILL.md").write_text("# bundled other")
+
+        ext_dir = tmp_path / "external_skills"
+        (ext_dir / "research" / "grounded-citations").mkdir(parents=True)
+        (ext_dir / "research" / "grounded-citations" / "SKILL.md").write_text("# bundled")
+
+        skills_dir = tmp_path / "user_skills"
+        skills_dir.mkdir()
+        # The local category dir is a symlink INTO the external tree.
+        (skills_dir / "research").symlink_to(ext_dir / "research", target_is_directory=True)
+        return bundled, skills_dir, ext_dir
+
+    def _patches(self, bundled, skills_dir, ext_dir):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
+        stack.enter_context(patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"))
+        stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
+        stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", skills_dir / ".bundled_manifest"))
+        stack.enter_context(patch("agent.skill_utils.get_external_skills_dirs", return_value=[ext_dir]))
+        return stack
+
+    def test_external_source_survives_and_sync_completes(self, tmp_path):
+        """The external copy must survive, and the rest of the bundle must still sync."""
+        bundled, skills_dir, ext_dir = self._setup(tmp_path)
+        external_skill = ext_dir / "research" / "grounded-citations" / "SKILL.md"
+
+        with self._patches(bundled, skills_dir, ext_dir):
+            result = sync_skills(quiet=True)
+
+        # The external source was NOT destroyed.
+        assert external_skill.exists()
+        assert (ext_dir / "research" / "grounded-citations").is_dir()
+        # The sync did not abort: the other bundled skill was still seeded.
+        assert "other-skill" in result["copied"]
+        assert "grounded-citations" in result["shadowed_by_external"]
+
+    def test_scope_guard_refusal_does_not_abort_sync(self, tmp_path):
+        """A scope-guard refusal is reported, not raised — one collision cannot
+        take the whole bundle sync down."""
+        from contextlib import ExitStack
+        from tools.skills_sync import _defer_to_external, _SyncState
+
+        bundled, skills_dir, ext_dir = self._setup(tmp_path)
+        dest = skills_dir / "research" / "grounded-citations"
+        st = _SyncState(manifest={"grounded-citations": "hash"}, quiet=True)
+
+        with self._patches(bundled, skills_dir, ext_dir):
+            with patch("tools.skills_sync._rmtree_writable", side_effect=ValueError("refusing to rmtree")):
+                # Must not raise.
+                _defer_to_external(st, "grounded-citations", dest, "hash")
+
+        assert "grounded-citations" in st.shadowed_by_external
+        assert (ext_dir / "research" / "grounded-citations" / "SKILL.md").exists()
