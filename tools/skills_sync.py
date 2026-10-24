@@ -292,6 +292,30 @@ def _recover_orphan_backup(dest: Path) -> None:
             logger.warning("Could not recover orphaned skill backup %s", orphan, exc_info=True)
 
 
+def _dest_is_inside_external(dest: Path) -> bool:
+    """True when ``dest`` resolves INTO one of the external_dirs trees.
+
+    A category directory under the local skills root may itself be a symlink into an
+    external tree (e.g. ``~/.hermes/skills/research -> ~/.agents/skills/research``).
+    The path then *looks* like a local skill dir but the files live in the user's
+    external repo. Deleting it would destroy the external source, not a stale local
+    shadow — so the shadow-removal step must be skipped.
+    """
+    from agent.skill_utils import get_external_skills_dirs
+    try:
+        resolved = dest.resolve()
+    except OSError:
+        return False
+    for ext_dir in get_external_skills_dirs():
+        try:
+            ext_resolved = Path(ext_dir).resolve()
+        except OSError:
+            continue
+        if resolved == ext_resolved or ext_resolved in resolved.parents:
+            return True
+    return False
+
+
 def _defer_to_external(st: _SyncState, skill_name: str, dest: Path, bundled_hash: str) -> None:
     """An external_dirs source provides this skill; a local copy would be a name collision the
     loader refuses. Defer for ALL manifest states; remove a stale local shadow from an earlier
@@ -300,7 +324,20 @@ def _defer_to_external(st: _SyncState, skill_name: str, dest: Path, bundled_hash
     st.skipped += 1
     st.say(f"  ⇢ {skill_name} (deferred to external_dirs, not written to local tree)")
     if dest.exists() and dir_hash(dest) == bundled_hash:
-        _rmtree_writable(dest)
+        # The local path may be a symlink into the external tree: what looks like a stale
+        # local shadow IS the external source. Deleting it would wipe the user's external
+        # repo, so leave it alone and keep the manifest entry as-is.
+        if _dest_is_inside_external(dest):
+            st.say(f"  · {skill_name} (local path resolves into external_dirs — not removing)")
+            return
+        try:
+            _rmtree_writable(dest)
+        except ValueError as e:
+            # Scope guard refused (path outside the skills root after resolution). One
+            # collision must not abort the whole bundle sync — report and continue.
+            st.say(f"  ! {skill_name} (skipped shadow removal: {e})")
+            logger.warning("Could not remove stale shadow of %s: %s", skill_name, e)
+            return
         st.say(f"  ✓ removed stale shadow of {skill_name}")
         st.manifest.pop(skill_name, None)
 
